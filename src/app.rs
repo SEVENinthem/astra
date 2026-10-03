@@ -34,7 +34,8 @@ fn now_ms() -> u64 {
 /// Events from background tasks (scans, pactl work, niri insert).
 pub enum UiBgEvent {
     Scan(scan::ScanResult),
-    MicState { ready: bool, passthrough: bool },
+    Status(String, bool),
+    MicState { ready: bool, passthrough: bool, source: bool },
     NiriResult(Result<String, String>),
     AddPaths(Vec<String>),
     /// Is anything capturing from the virtual mic?
@@ -116,6 +117,7 @@ pub struct AstraApp {
 
     playing: HashMap<u64, f32>,
     mic_ready: bool,
+    source_ready: bool,
     passthrough: bool,
     mic_hint_shown: bool,
 
@@ -184,6 +186,7 @@ impl AstraApp {
             portal_status: (String::new(), false),
             playing: HashMap::new(),
             mic_ready: false,
+            source_ready: false,
             passthrough: false,
             mic_hint_shown: false,
             search: String::new(),
@@ -210,6 +213,7 @@ impl AstraApp {
             let mon = app.cfg.settings.monitor_locally;
             std::thread::spawn(move || {
                 let ready = mic::ensure_sink().is_ok();
+                let source = mic::ensure_source().is_ok();
                 let pass = if ready && settings_pass {
                     mic::set_passthrough(true, src.as_deref()).unwrap_or(false)
                 } else {
@@ -221,6 +225,14 @@ impl AstraApp {
                 let _ = bg.send(UiBgEvent::MicState {
                     ready,
                     passthrough: pass,
+                    source,
+                });
+                // Bridge: mix (monitor) -> virtual microphone source
+                let bg2 = bg.clone();
+                crate::audio::bridge::spawn(move |res| {
+                    if let Err(e) = res {
+                        let _ = bg2.send(UiBgEvent::Status(format!("virtual mic: {e}"), false));
+                    }
                 });
             });
         }
@@ -363,8 +375,9 @@ impl AstraApp {
                     }
                     self.dirty = true;
                 }
-                UiBgEvent::MicState { ready, passthrough } => {
+                UiBgEvent::MicState { ready, passthrough, source } => {
                     self.mic_ready = ready;
+                    self.source_ready = source;
                     self.passthrough = passthrough;
                     if !ready {
                         self.set_status(self.t(K::ErrNoPactl), false);
@@ -377,6 +390,7 @@ impl AstraApp {
                     self.niri_status =
                         Some((format!("{}: {e}", self.t(K::InsertFail)), false));
                 }
+                UiBgEvent::Status(msg, ok) => self.set_status(msg, ok),
                 UiBgEvent::AddPaths(paths) => self.add_paths(&paths),
                 UiBgEvent::MicCapture(listening) => {
                     if !listening {
@@ -531,6 +545,7 @@ impl AstraApp {
         let mon = self.cfg.settings.monitor_locally;
         std::thread::spawn(move || {
             let ready = mic::ensure_sink().is_ok();
+            let source = mic::ensure_source().is_ok();
             let pass_state = if ready && pass {
                 mic::set_passthrough(true, src.as_deref()).unwrap_or(false)
             } else if ready {
@@ -544,7 +559,16 @@ impl AstraApp {
             let _ = bg.send(UiBgEvent::MicState {
                 ready,
                 passthrough: pass_state,
+                source,
             });
+            if source {
+                let bg2 = bg.clone();
+                crate::audio::bridge::spawn(move |res| {
+                    if let Err(e) = res {
+                        let _ = bg2.send(UiBgEvent::Status(format!("virtual mic: {e}"), false));
+                    }
+                });
+            }
         });
     }
 
@@ -1304,12 +1328,18 @@ impl AstraApp {
     }
 
     fn mic_section(&mut self, ui: &mut egui::Ui) {
-        let status = if self.mic_ready {
+        let sink_status = if self.mic_ready {
             RichText::new(format!("● {}", self.t(K::MicStatusSink))).color(Color32::from_rgb(120, 220, 140))
         } else {
             RichText::new(format!("● {}", self.t(K::MicStatusNoSink))).color(Color32::from_rgb(220, 120, 120))
         };
-        ui.label(status);
+        ui.label(sink_status);
+        let source_status = if self.source_ready {
+            RichText::new(format!("● {}", self.t(K::MicStatusSource))).color(Color32::from_rgb(120, 220, 140))
+        } else {
+            RichText::new(format!("● {}", self.t(K::MicStatusSourceMissing))).color(Color32::from_rgb(220, 120, 120))
+        };
+        ui.label(source_status);
         ui.label(RichText::new(self.t(K::DiscordHint)).weak().small());
 
         ui.add_space(4.0);
@@ -1348,7 +1378,7 @@ impl AstraApp {
                         self.apply_mic_settings();
                     }
                     for (name, desc) in &sources {
-                        if name.contains(".monitor") {
+                        if name.contains(".monitor") || name.starts_with("astra_") {
                             continue;
                         }
                         if ui.selectable_label(&current == name, desc).clicked() {

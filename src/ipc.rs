@@ -189,7 +189,7 @@ fn handle_cmd(
             "queued".into()
         }
         "mic" => {
-            if let Err(e) = crate::audio::mic::ensure_sink() {
+            if let Err(e) = crate::audio::mic::ensure_sink().and_then(|_| crate::audio::mic::ensure_source()) {
                 return format!("ERR {e}");
             }
             let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("status");
@@ -210,11 +210,11 @@ fn handle_cmd(
                     }
                 }
                 _ => {
-                    let sink = crate::audio::mic::sink_exists(crate::audio::mic::MIC_SINK_NAME);
+                    let source = crate::audio::mic::source_exists(crate::audio::mic::MIC_SOURCE_NAME);
                     let pass = crate::audio::mic::passthrough_active();
                     format!(
                         "virtual-mic: {}, passthrough: {}",
-                        if sink { "on" } else { "off" },
+                        if source { "on" } else { "off" },
                         if pass { "on" } else { "off" }
                     )
                 }

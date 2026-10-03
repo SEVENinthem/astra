@@ -1,13 +1,23 @@
-//! Virtual microphone management on top of PipeWire (via pipewire-pulse's
-//! pactl interface). Creates a null sink that apps can use as a microphone
-//! input, and optional loopbacks:
-//!   * passthrough — real mic -> virtual mic (your voice keeps working)
-//!   * local monitor — virtual mic -> speakers (hear what Discord hears)
+//! Virtual microphone on top of PipeWire (via pipewire-pulse's pactl).
+//!
+//! Two devices are involved:
+//!   * `astra_mic` — an internal null *sink*. ASTRA plays sounds into it and
+//!     the microphone passthrough (real mic) is loopbacked into it, so the
+//!     sink's monitor carries the full mix.
+//!   * `astra_virtual_mic` — a *source* (module-pipe-source) fed by the
+//!     bridge thread from that monitor. It is a real input device, so apps
+//!     with Chromium-style monitor filtering (Discord) list it as a
+//!     microphone, unlike the monitor itself.
 
+use std::path::PathBuf;
 use std::process::Command;
 
 pub const MIC_SINK_NAME: &str = "astra_mic";
-pub const MIC_DESCRIPTION: &str = "ASTRA Virtual Microphone";
+pub const SINK_DESCRIPTION: &str = "ASTRA Sounds (internal)";
+pub const MIC_SOURCE_NAME: &str = "astra_virtual_mic";
+/// NBSP (U+00A0) instead of spaces: the pipewire module arg parser splits
+/// values at plain spaces, NBSP survives and renders as a space everywhere.
+pub const SOURCE_DESCRIPTION: &str = "ASTRA\u{00a0}Virtual\u{00a0}Microphone";
 
 fn pactl(args: &[&str]) -> Result<String, String> {
     let out = Command::new("pactl")
@@ -30,6 +40,17 @@ pub fn pactl_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+pub fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(dirs::runtime_dir)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+pub fn source_fifo() -> PathBuf {
+    runtime_dir().join(format!("{MIC_SOURCE_NAME}.pcm"))
 }
 
 /// All sinks as (name, description).
@@ -74,28 +95,36 @@ pub fn default_source() -> Option<String> {
     pactl(&["get-default-source"]).ok().map(|s| s.trim().into())
 }
 
-pub fn sink_exists(name: &str) -> bool {
-    pactl(&["list", "short", "sinks"])
+fn device_exists(kind: &str, name: &str) -> bool {
+    pactl(&["list", "short", kind])
         .map(|out| out.lines().any(|l| l.split('\t').nth(1) == Some(name)))
         .unwrap_or(false)
 }
 
-/// Make sure the virtual mic sink exists (idempotent).
+pub fn sink_exists(name: &str) -> bool {
+    device_exists("sinks", name)
+}
+
+pub fn source_exists(name: &str) -> bool {
+    device_exists("sources", name)
+}
+
+fn sink_description(name: &str) -> Option<String> {
+    list_sinks()
+        .ok()?
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, d)| d.clone())
+}
+
+/// Make sure the internal mixer sink exists (idempotent). Recreates it if an
+/// older version left one with a mangled description.
 pub fn ensure_sink() -> Result<(), String> {
     if !pactl_available() {
         return Err("pactl-not-found".into());
     }
     if sink_exists(MIC_SINK_NAME) {
-        // migrate sinks created by older versions, whose description was
-        // mangled to "ASTRA" by the pactl/pipewire arg parser
-        let ok_desc = list_sinks()
-            .ok()
-            .and_then(|v| {
-                v.iter()
-                    .find(|(n, _)| n == MIC_SINK_NAME)
-                    .map(|(_, d)| d.clone())
-            })
-            .is_some_and(|d| d == MIC_DESCRIPTION);
+        let ok_desc = sink_description(MIC_SINK_NAME).is_some_and(|d| d == SINK_DESCRIPTION);
         if ok_desc {
             return Ok(());
         }
@@ -105,37 +134,67 @@ pub fn ensure_sink() -> Result<(), String> {
         "load-module",
         "module-null-sink",
         &format!("sink_name={MIC_SINK_NAME}"),
-        &format!("sink_properties={{ device.description=\"{MIC_DESCRIPTION}\" }}"),
+        &format!("sink_properties={{ device.description=\"{SINK_DESCRIPTION}\" }}"),
     ])
     .map(|_| ())
-    .map_err(|e| format!("create virtual mic: {e}"))
+    .map_err(|e| format!("create mixer sink: {e}"))
 }
 
-/// Is anything capturing from the virtual mic (i.e. did some app select it
-/// as its input)?
-pub fn has_capture() -> bool {
-    pactl(&["list", "short", "source-outputs"])
-        .map(|out| {
-            out.lines().any(|l| {
-                l.split('\t')
-                    .nth(1)
-                    .is_some_and(|s| s.starts_with(MIC_SINK_NAME))
-            })
-        })
-        .unwrap_or(false)
+/// Make sure the virtual microphone *source* exists (idempotent). This is
+/// the device apps select as their input.
+pub fn ensure_source() -> Result<(), String> {
+    if !pactl_available() {
+        return Err("pactl-not-found".into());
+    }
+    if source_exists(MIC_SOURCE_NAME) {
+        return Ok(());
+    }
+    let fifo = source_fifo();
+    let _ = std::fs::remove_file(&fifo);
+    pactl(&[
+        "load-module",
+        "module-pipe-source",
+        &format!("source_name={MIC_SOURCE_NAME}"),
+        &format!("file={}", fifo.display()),
+        "format=s16le",
+        "rate=48000",
+        "channels=2",
+        &format!("source_properties=device.description={SOURCE_DESCRIPTION}"),
+    ])
+    .map(|_| ())
+    .map_err(|e| format!("create virtual mic source: {e}"))
 }
 
-/// Remove the virtual mic sink and any loopbacks attached to it (idempotent).
+/// Remove the mixer sink and loopbacks attached to it (idempotent).
 pub fn destroy_sink() {
     let _ = unload_loopbacks_to(MIC_SINK_NAME);
-    if let Ok(mods) = pactl(&["list", "short", "modules"]) {
-        for line in mods.lines() {
-            let cols: Vec<&str> = line.split('\t').collect();
-            if cols.len() >= 3 && cols[1] == "module-null-sink" && cols[2].contains(MIC_SINK_NAME) {
-                let _ = pactl(&["unload-module", cols[0]]);
+    if let Ok(mods) = modules() {
+        for (idx, name, args) in mods {
+            if name == "module-null-sink" && args.contains(MIC_SINK_NAME) {
+                let _ = pactl(&["unload-module", &idx]);
             }
         }
     }
+}
+
+/// Remove everything ASTRA created in PipeWire (idempotent).
+pub fn destroy_all() {
+    if let Ok(mods) = modules() {
+        for (idx, name, args) in mods {
+            let loopback_into_sink = name == "module-loopback"
+                && args.split_whitespace().any(|a| a == &format!("sink={MIC_SINK_NAME}"));
+            let local_monitor = name == "module-loopback"
+                && args
+                    .split_whitespace()
+                    .any(|a| a == &format!("source={MIC_SINK_NAME}.monitor"));
+            let our_sink = name == "module-null-sink" && args.contains(MIC_SINK_NAME);
+            let our_source = name == "module-pipe-source" && args.contains(MIC_SOURCE_NAME);
+            if loopback_into_sink || local_monitor || our_sink || our_source {
+                let _ = pactl(&["unload-module", &idx]);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(source_fifo());
 }
 
 fn modules() -> Result<Vec<(String, String, String)>, String> {
@@ -174,7 +233,7 @@ fn loopback_present(source: Option<&str>, sink: &str) -> bool {
     })
 }
 
-/// Toggle mic passthrough (real microphone -> virtual mic). Returns new state.
+/// Toggle mic passthrough (real microphone -> mixer sink). Returns new state.
 pub fn set_passthrough(on: bool, source: Option<&str>) -> Result<bool, String> {
     let src = source
         .map(|s| s.to_string())
@@ -203,14 +262,14 @@ pub fn passthrough_active() -> bool {
     loopback_present(None, MIC_SINK_NAME)
 }
 
-/// Toggle local monitoring: virtual mic -> speakers (hear what apps hear).
+/// Toggle local monitoring: mixer sink -> speakers (hear what apps hear).
 pub fn set_local_monitor(on: bool, sink: Option<&str>) -> Result<bool, String> {
     let dst = sink
         .map(|s| s.to_string())
         .or_else(default_sink)
         .ok_or("no default sink found")?;
     if on {
-        if loopback_present(Some(&format!("{MIC_SINK_NAME}.monitor")), &dst) {
+        if local_monitor_active() {
             return Ok(true);
         }
         pactl(&[
@@ -222,7 +281,6 @@ pub fn set_local_monitor(on: bool, sink: Option<&str>) -> Result<bool, String> {
         .map_err(|e| format!("monitor: {e}"))?;
         Ok(true)
     } else {
-        // unload monitor loopbacks only (source = our monitor, any sink)
         for (idx, name, args) in modules()? {
             if name == "module-loopback"
                 && args
@@ -248,13 +306,27 @@ pub fn local_monitor_active() -> bool {
     })
 }
 
+/// Is anything capturing from the virtual mic (did some app select it as
+/// its input)?
+pub fn has_capture() -> bool {
+    pactl(&["list", "short", "source-outputs"])
+        .map(|out| {
+            out.lines().any(|l| {
+                l.split('\t')
+                    .nth(1)
+                    .is_some_and(|s| s.starts_with(MIC_SOURCE_NAME))
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Called on app exit: remove our PipeWire leftovers unless the user asked
-/// to keep the virtual mic around.
-pub fn cleanup_on_exit(keep_virtual_mic: bool) {
-    if keep_virtual_mic {
+/// to keep them around.
+pub fn cleanup_on_exit(keep: bool) {
+    if keep {
         return;
     }
-    destroy_sink();
+    destroy_all();
 }
 
 #[cfg(test)]
