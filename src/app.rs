@@ -36,6 +36,9 @@ pub enum UiBgEvent {
     Scan(scan::ScanResult),
     MicState { ready: bool, passthrough: bool },
     NiriResult(Result<String, String>),
+    AddPaths(Vec<String>),
+    /// Is anything capturing from the virtual mic?
+    MicCapture(bool),
 }
 
 #[derive(Clone, PartialEq)]
@@ -114,6 +117,7 @@ pub struct AstraApp {
     playing: HashMap<u64, f32>,
     mic_ready: bool,
     passthrough: bool,
+    mic_hint_shown: bool,
 
     search: String,
     side: SideSelection,
@@ -181,6 +185,7 @@ impl AstraApp {
             playing: HashMap::new(),
             mic_ready: false,
             passthrough: false,
+            mic_hint_shown: false,
             search: String::new(),
             side: SideSelection::All,
             selected: None,
@@ -303,6 +308,10 @@ impl AstraApp {
 
     fn on_started(&mut self, id: u64) {
         self.playing.insert(id, 0.0);
+        let route = self
+            .cfg
+            .sound(id)
+            .map(|s| s.route.resolve(self.cfg.settings.default_route));
         if let Some(s) = self.cfg.sound_mut(id) {
             s.play_count += 1;
             s.last_played_ms = Some(now_ms());
@@ -311,6 +320,16 @@ impl AstraApp {
         self.cfg.recent.insert(0, id);
         self.cfg.recent.truncate(12);
         self.dirty = true;
+        // If the sound goes only to the virtual mic and nothing is capturing
+        // it, the user hears nothing — nudge once per session.
+        if route == Some(Route::Mic) && !self.mic_hint_shown {
+            self.mic_hint_shown = true;
+            let bg = self.bg_tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                let _ = bg.send(UiBgEvent::MicCapture(crate::audio::mic::has_capture()));
+            });
+        }
     }
 
     // ---------------------------------------------------------------- events
@@ -357,6 +376,12 @@ impl AstraApp {
                 UiBgEvent::NiriResult(Err(e)) => {
                     self.niri_status =
                         Some((format!("{}: {e}", self.t(K::InsertFail)), false));
+                }
+                UiBgEvent::AddPaths(paths) => self.add_paths(&paths),
+                UiBgEvent::MicCapture(listening) => {
+                    if !listening {
+                        self.set_status(self.t(K::MicNobodyListening), false);
+                    }
                 }
             }
         }
@@ -544,23 +569,41 @@ impl AstraApp {
 
     fn add_files_dialog(&mut self) {
         let filters = AUDIO_EXTS.to_vec();
-        if let Some(files) = rfd::FileDialog::new()
-            .add_filter("Audio", &filters)
-            .pick_files()
-        {
+        let bg = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok();
+            let fut = rfd::AsyncFileDialog::new()
+                .add_filter("Audio", &filters)
+                .pick_files();
+            let Some(rt) = rt else { return };
+            let files = rt.block_on(fut).unwrap_or_default();
             let paths: Vec<String> = files
                 .iter()
-                .map(|p| p.to_string_lossy().into_owned())
+                .map(|f| f.path().to_string_lossy().into_owned())
                 .collect();
-            self.add_paths(&paths);
-        }
+            if !paths.is_empty() {
+                let _ = bg.send(UiBgEvent::AddPaths(paths));
+            }
+        });
     }
 
     fn add_folder_dialog(&mut self) {
-        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-            let p = dir.to_string_lossy().into_owned();
-            self.add_paths(&[p]);
-        }
+        let bg = self.bg_tx.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok();
+            let fut = rfd::AsyncFileDialog::new().pick_folder();
+            let Some(rt) = rt else { return };
+            if let Some(h) = rt.block_on(fut) {
+                let p = h.path().to_string_lossy().into_owned();
+                let _ = bg.send(UiBgEvent::AddPaths(vec![p]));
+            }
+        });
     }
 
     pub fn add_paths(&mut self, paths: &[String]) {

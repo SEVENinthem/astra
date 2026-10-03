@@ -9,9 +9,9 @@ use crate::i18n::Lang;
 /// so voice-chat apps that selected it as input will hear the sound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Route {
-    #[default]
     Speakers,
     Mic,
+    #[default]
     Both,
 }
 

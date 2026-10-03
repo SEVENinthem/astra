@@ -1,6 +1,6 @@
 # Maintainer: SEVENinthem <https://github.com/SEVENinthem>
 pkgname=astra-soundboard
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Soundpad-style soundboard for Linux (PipeWire, Wayland)"
 arch=('x86_64')

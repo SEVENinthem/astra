@@ -86,16 +86,43 @@ pub fn ensure_sink() -> Result<(), String> {
         return Err("pactl-not-found".into());
     }
     if sink_exists(MIC_SINK_NAME) {
-        return Ok(());
+        // migrate sinks created by older versions, whose description was
+        // mangled to "ASTRA" by the pactl/pipewire arg parser
+        let ok_desc = list_sinks()
+            .ok()
+            .and_then(|v| {
+                v.iter()
+                    .find(|(n, _)| n == MIC_SINK_NAME)
+                    .map(|(_, d)| d.clone())
+            })
+            .is_some_and(|d| d == MIC_DESCRIPTION);
+        if ok_desc {
+            return Ok(());
+        }
+        destroy_sink();
     }
     pactl(&[
         "load-module",
         "module-null-sink",
         &format!("sink_name={MIC_SINK_NAME}"),
-        &format!("sink_properties=device.description='{MIC_DESCRIPTION}'"),
+        &format!("sink_properties={{ device.description=\"{MIC_DESCRIPTION}\" }}"),
     ])
     .map(|_| ())
     .map_err(|e| format!("create virtual mic: {e}"))
+}
+
+/// Is anything capturing from the virtual mic (i.e. did some app select it
+/// as its input)?
+pub fn has_capture() -> bool {
+    pactl(&["list", "short", "source-outputs"])
+        .map(|out| {
+            out.lines().any(|l| {
+                l.split('\t')
+                    .nth(1)
+                    .is_some_and(|s| s.starts_with(MIC_SINK_NAME))
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Remove the virtual mic sink and any loopbacks attached to it (idempotent).
