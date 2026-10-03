@@ -35,6 +35,7 @@ pub enum IpcToUi {
     Add(Vec<String>),
     Reload,
     Quit,
+    Focus,
 }
 
 pub type Snapshot = Arc<Mutex<Vec<PlayEntry>>>;
@@ -232,6 +233,10 @@ fn handle_cmd(
             let _ = ui_tx.send(IpcToUi::Quit);
             "bye".into()
         }
+        "focus" => {
+            let _ = ui_tx.send(IpcToUi::Focus);
+            "focused".into()
+        }
         other => format!("ERR unknown command '{other}'"),
     }
 }
@@ -266,6 +271,7 @@ pub fn client(cmd: crate::Command) -> Result<(), String> {
         crate::Command::Vol { value } => json!({"cmd": "vol", "value": value}),
         crate::Command::Reload => json!({"cmd": "reload"}),
         crate::Command::Quit => json!({"cmd": "quit"}),
+        crate::Command::Focus => json!({"cmd": "focus"}),
     };
     let out = send(&v.to_string())?;
     if !out.is_empty() {

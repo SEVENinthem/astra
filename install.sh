@@ -20,8 +20,11 @@ if [[ ! -x "$BIN_SRC" ]]; then
 fi
 
 install -Dm755 "$BIN_SRC" "$BIN_DST"
-install -Dm644 "$(dirname "$0")/assets/astra.desktop" "$DESKTOP_DST"
 install -Dm644 "$(dirname "$0")/assets/astra.svg" "$ICON_DST"
+# desktop file with absolute paths so any launcher environment can exec it
+sed -e "s|^Exec=astra$|Exec=${BIN_DST}|" \
+    -e "s|^Icon=astra$|Icon=${ICON_DST}|" \
+    "$(dirname "$0")/assets/astra.desktop" > "$DESKTOP_DST"
 
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "${PREFIX}/share/applications" || true
 command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -qtf "${PREFIX}/share/icons/hicolor" || true

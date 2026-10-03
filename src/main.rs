@@ -53,6 +53,8 @@ enum Command {
     Reload,
     /// Close the running ASTRA instance
     Quit,
+    /// Raise the window of the running instance
+    Focus,
 }
 
 fn main() {
@@ -66,8 +68,9 @@ fn main() {
         }
         None => {
             if ipc::server_alive() {
-                eprintln!("astra: ASTRA is already running.");
-                std::process::exit(0);
+                // Second launch: raise the existing window instead of dying silently.
+                let _ = ipc::client(Command::Focus);
+                return;
             }
             if let Err(e) = gui() {
                 eprintln!("astra: {e}");
