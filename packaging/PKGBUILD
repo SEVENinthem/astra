@@ -1,0 +1,26 @@
+# Maintainer: SEVENinthem <https://github.com/SEVENinthem>
+pkgname=astra-soundboard
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Soundpad-style soundboard for Linux (PipeWire, Wayland)"
+arch=('x86_64')
+url="https://github.com/SEVENinthem/astra"
+license=('MIT')
+depends=('gtk3' 'pipewire-pulse' 'libpulse' 'hicolor-icon-theme')
+makedepends=('cargo' 'pkg-config')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+options=(!lto)
+
+build() {
+  cd "astra-$pkgver"
+  cargo build --release --locked
+}
+
+package() {
+  cd "astra-$pkgver"
+  install -Dm755 target/release/astra "$pkgdir/usr/bin/astra"
+  install -Dm644 assets/astra.desktop "$pkgdir/usr/share/applications/astra.desktop"
+  install -Dm644 assets/astra.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/astra.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

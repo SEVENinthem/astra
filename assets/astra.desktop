@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ASTRA
+GenericName=Soundboard
+Comment=Soundpad-style soundboard for Linux (PipeWire, Wayland)
+Comment[ru]=Саундборд в духе Soundpad для Linux (PipeWire, Wayland)
+Exec=astra
+Icon=astra
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=soundboard;soundpad;sounds;pipewire;mic;
+StartupNotify=false

@@ -1,0 +1,31 @@
+[package]
+name = "astra"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "ASTRA — a Soundpad-style soundboard for Linux (PipeWire, Wayland)"
+license = "MIT"
+repository = "https://github.com/SEVENinthem/astra"
+readme = "README.md"
+keywords = ["soundboard", "soundpad", "pipewire", "wayland", "audio"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+eframe = "0.29"
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
+libpulse-binding = "2.28"
+libpulse-simple-binding = "2.28"
+symphonia = { version = "0.5", features = ["mp3", "wav", "ogg", "flac", "pcm", "vorbis", "aac", "isomp4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+clap = { version = "4", features = ["derive"] }
+ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+bytemuck = "1"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
