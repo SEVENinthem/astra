@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eframe::egui;
 use egui::{Align, Color32, Layout, RichText};
 
-use crate::audio::engine::{Engine, EngineEvent, EngineMsg, PlayRequest};
+use crate::audio::engine::{Engine, EngineEvent, EngineMsg, PlayRequest, PRELOAD_MAX_SECS};
 use crate::audio::{mic, scan};
 use crate::config::{hotkey, Config, Route, RouteOverride, Sort, Sound};
 use crate::i18n::{tr, K, Lang};
@@ -34,7 +34,6 @@ fn now_ms() -> u64 {
 /// Events from background tasks (scans, pactl work, niri insert).
 pub enum UiBgEvent {
     Scan(scan::ScanResult),
-    Status(String, bool),
     MicState { ready: bool, passthrough: bool, source: bool },
     NiriResult(Result<String, String>),
     AddPaths(Vec<String>),
@@ -101,6 +100,7 @@ enum PendingDelete {
 }
 
 pub struct AstraApp {
+    ctx: egui::Context,
     lang: Lang,
     cfg: Config,
     cfg_path: PathBuf,
@@ -172,6 +172,7 @@ impl AstraApp {
         );
 
         let mut app = AstraApp {
+            ctx: ctx.clone(),
             lang,
             cfg,
             cfg_path,
@@ -227,18 +228,14 @@ impl AstraApp {
                     passthrough: pass,
                     source,
                 });
-                // Bridge: mix (monitor) -> virtual microphone source
-                let bg2 = bg.clone();
-                crate::audio::bridge::spawn(move |res| {
-                    if let Err(e) = res {
-                        let _ = bg2.send(UiBgEvent::Status(format!("virtual mic: {e}"), false));
-                    }
-                });
             });
         }
 
         app.refresh_snapshot();
         app.rebind_portal();
+        for s in &app.cfg.sounds {
+            app.preload(s);
+        }
         app
     }
 
@@ -297,6 +294,13 @@ impl AstraApp {
                 .stop_others
                 .unwrap_or(self.cfg.settings.stop_others),
             speed: s.speed,
+        }
+    }
+
+    /// Decode short sounds ahead of time so the first press is instant.
+    fn preload(&self, s: &Sound) {
+        if s.duration_secs > 0.0 && s.duration_secs <= PRELOAD_MAX_SECS {
+            self.engine.preload(&s.path);
         }
     }
 
@@ -373,6 +377,9 @@ impl AstraApp {
                         s.duration_secs = res.duration_secs;
                         s.peak = res.peak;
                     }
+                    if let Some(s) = self.cfg.sound(res.id) {
+                        self.preload(s);
+                    }
                     self.dirty = true;
                 }
                 UiBgEvent::MicState { ready, passthrough, source } => {
@@ -390,7 +397,6 @@ impl AstraApp {
                     self.niri_status =
                         Some((format!("{}: {e}", self.t(K::InsertFail)), false));
                 }
-                UiBgEvent::Status(msg, ok) => self.set_status(msg, ok),
                 UiBgEvent::AddPaths(paths) => self.add_paths(&paths),
                 UiBgEvent::MicCapture(listening) => {
                     if !listening {
@@ -441,13 +447,6 @@ impl AstraApp {
         }
         for ev in events {
             match ev {
-                PortalEvent::Activated(id) => {
-                    if id == "stop-all" {
-                        self.engine.stop_all();
-                    } else if let Ok(n) = id.parse::<u64>() {
-                        self.play(n);
-                    }
-                }
                 PortalEvent::Status(msg, ok) => {
                     self.portal_status = (
                         if ok {
@@ -561,14 +560,6 @@ impl AstraApp {
                 passthrough: pass_state,
                 source,
             });
-            if source {
-                let bg2 = bg.clone();
-                crate::audio::bridge::spawn(move |res| {
-                    if let Err(e) = res {
-                        let _ = bg2.send(UiBgEvent::Status(format!("virtual mic: {e}"), false));
-                    }
-                });
-            }
         });
     }
 
@@ -736,7 +727,24 @@ impl AstraApp {
             .collect();
         let (tx, rx) = mpsc::channel();
         self.portal_rx = Some(rx);
-        self.portal = Some(crate::portal::start(bindings, tx));
+        // Hotkeys go straight to the engine from the portal thread: the UI
+        // loop only runs on repaint and may not run at all while the window
+        // is hidden behind a game.
+        let engine_tx = self.engine.tx.clone();
+        let snapshot = self.ipc_snapshot.clone();
+        let ctx = self.ctx.clone();
+        let on_activate = move |id: &str| {
+            if id == "stop-all" {
+                let _ = engine_tx.send(EngineMsg::StopAll);
+            } else if let Ok(n) = id.parse::<u64>() {
+                let entry = snapshot.lock().unwrap().iter().find(|e| e.id == n).cloned();
+                if let Some(e) = entry {
+                    let _ = engine_tx.send(EngineMsg::Play(e.request()));
+                }
+            }
+            ctx.request_repaint();
+        };
+        self.portal = Some(crate::portal::start(bindings, tx, on_activate));
     }
 
     // ------------------------------------------------------------ filtering

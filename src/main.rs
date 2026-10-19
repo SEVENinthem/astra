@@ -5,6 +5,7 @@ mod audio;
 mod config;
 mod i18n;
 mod ipc;
+mod latency;
 mod niri;
 mod portal;
 
@@ -55,11 +56,23 @@ enum Command {
     Quit,
     /// Raise the window of the running instance
     Focus,
+    /// Measure trigger -> virtual microphone latency (runs standalone)
+    Latency {
+        /// Number of measurements
+        #[arg(long, default_value_t = 10)]
+        runs: usize,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
     match cli.command {
+        Some(Command::Latency { runs }) => {
+            if let Err(e) = latency::run(runs.max(1)) {
+                eprintln!("astra: {e}");
+                std::process::exit(1);
+            }
+        }
         Some(cmd) => {
             if let Err(e) = ipc::client(cmd) {
                 eprintln!("astra: {e}");
