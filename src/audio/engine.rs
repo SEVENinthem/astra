@@ -45,7 +45,7 @@ const FADE: usize = 240;
 const CACHE_BUDGET: usize = 64 * 1024 * 1024;
 /// Bass slider range (dB) and shelf corner frequency.
 pub const BASS_MIN_DB: f32 = -12.0;
-pub const BASS_MAX_DB: f32 = 15.0;
+pub const BASS_MAX_DB: f32 = 70.0;
 const BASS_HZ: f32 = 120.0;
 /// Sounds up to this length are decoded ahead of time.
 pub const PRELOAD_MAX_SECS: f32 = 30.0;
@@ -1023,6 +1023,19 @@ mod tests {
         assert!(shelf_gain_db(12.0, 3000.0).abs() < 0.5);
         assert!((shelf_gain_db(-12.0, 30.0) + 12.0).abs() < 0.7);
         assert!(shelf_gain_db(0.0, 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn bass_shelf_stable_at_max() {
+        // +70 dB: no NaN/blow-up in f32, lows really boosted
+        // a +70 dB shelf is wide: ~+65 dB at 20 Hz, a few dB leak up high
+        assert!(shelf_gain_db(BASS_MAX_DB, 20.0) > 60.0);
+        assert!(shelf_gain_db(BASS_MAX_DB, 5000.0) < 5.0);
+        let mut f = LowShelf::default();
+        f.set_db(BASS_MAX_DB);
+        let mut buf = vec![0.5f32; 96_000];
+        f.process(&mut buf);
+        assert!(buf.iter().all(|x| x.is_finite()));
     }
 
     #[test]
