@@ -133,6 +133,9 @@ pub struct Settings {
     /// speakers/headphones.
     #[serde(default)]
     pub mute_speakers: bool,
+    /// Bass shelf gain in dB, 0 = flat.
+    #[serde(default)]
+    pub bass_db: f32,
     #[serde(default)]
     pub keep_virtual_mic: bool,
     #[serde(default = "d_true")]
