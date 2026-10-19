@@ -28,6 +28,7 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use rubato::{FftFixedInOut, Resampler};
 
 use crate::audio::mic;
 use crate::config::Route;
@@ -63,6 +64,11 @@ pub enum EngineMsg {
     StopAll,
     SetMasterVolume(f32),
     SetSpeakerSink(Option<String>),
+    /// Keep playing, but silence ASTRA's own speaker/headphone output.
+    SetSpeakersMuted(bool),
+    /// Local monitoring (mixer -> speakers loopback) is on: "Both" then
+    /// skips the direct speaker copy, or you would hear every sound twice.
+    SetLocalMonitor(bool),
     /// Decode a file into the cache ahead of time.
     Preload(String),
     /// Ask whether a sound is currently playing (for `astra toggle`).
@@ -90,6 +96,7 @@ impl Engine {
             master: AtomicU32::new(master_volume.to_bits()),
             active: Mutex::new(HashSet::new()),
             events: Mutex::new(etx),
+            speakers_muted: AtomicBool::new(false),
         });
         let cache = Arc::new(Mutex::new(Cache::default()));
 
@@ -132,6 +139,7 @@ struct Shared {
     /// Ids with a reporting voice alive somewhere.
     active: Mutex<HashSet<u64>>,
     events: Mutex<Sender<EngineEvent>>,
+    speakers_muted: AtomicBool,
 }
 
 impl Shared {
@@ -157,6 +165,7 @@ fn control(
     mic_out: Sender<MixCmd>,
     preload: Sender<String>,
 ) {
+    let mut local_monitor = false;
     for msg in rx {
         match msg {
             EngineMsg::Play(req) => {
@@ -173,6 +182,7 @@ fn control(
                 let targets: &[&Sender<MixCmd>] = match req.route {
                     Route::Speakers => &[&speakers],
                     Route::Mic => &[&mic_out],
+                    Route::Both if local_monitor => &[&mic_out],
                     Route::Both => &[&mic_out, &speakers],
                 };
                 shared.active.lock().unwrap().insert(req.id);
@@ -195,6 +205,10 @@ fn control(
             EngineMsg::SetSpeakerSink(sink) => {
                 let _ = speakers.send(MixCmd::SetDevice(sink));
             }
+            EngineMsg::SetSpeakersMuted(m) => {
+                shared.speakers_muted.store(m, Ordering::Relaxed);
+            }
+            EngineMsg::SetLocalMonitor(on) => local_monitor = on,
             EngineMsg::Preload(path) => {
                 let _ = preload.send(path);
             }
@@ -207,7 +221,7 @@ fn control(
 
 // ------------------------------------------------------------------ clips
 
-/// Decoded audio, interleaved stereo at the file's own rate. Filled
+/// Decoded audio, interleaved stereo, resampled to OUT_RATE at decode time. Filled
 /// progressively by a decoder thread; mixers read what is there so far.
 struct Clip {
     rate: AtomicU32,
@@ -349,7 +363,9 @@ fn decode_inner(path: &str, clip: &Clip) -> Result<(), String> {
     // Reserve up front: growing the Vec later would hold the write lock
     // during a big copy while mixers wait to read.
     if let Some(n) = track.codec_params.n_frames {
-        clip.data.write().unwrap().reserve(n as usize * 2 + 8192);
+        let rate = track.codec_params.sample_rate.unwrap_or(OUT_RATE).max(1);
+        let out_frames = n * OUT_RATE as u64 / rate as u64;
+        clip.data.write().unwrap().reserve(out_frames as usize * 2 + 8192);
     }
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
@@ -357,6 +373,7 @@ fn decode_inner(path: &str, clip: &Clip) -> Result<(), String> {
 
     let mut sample_buf: Option<(SampleBuffer<f32>, usize)> = None;
     let mut stereo: Vec<f32> = Vec::new();
+    let mut rs: Option<ToOutRate> = None;
     loop {
         let packet = match format.next_packet() {
             Ok(p) => p,
@@ -387,15 +404,124 @@ fn decode_inner(path: &str, clip: &Clip) -> Result<(), String> {
             stereo.push(l);
             stereo.push(r);
         }
-        clip.data.write().unwrap().extend_from_slice(&stereo);
-        if clip.rate.load(Ordering::Relaxed) == 0 {
-            clip.rate.store(spec.rate, Ordering::Release);
+        if rs.is_none() {
+            rs = Some(ToOutRate::new(spec.rate)?);
+        }
+        rs.as_mut().unwrap().push(&stereo, clip)?;
+    }
+    match rs {
+        Some(mut r) => r.finish(clip),
+        None => Err("no samples".into()),
+    }
+}
+
+/// Streaming high-quality (FFT/sinc) conversion of interleaved stereo to
+/// OUT_RATE. Doing it once at decode time keeps the mixer a plain copy at
+/// normal speed, so the sound comes out bit-exact.
+struct ToOutRate {
+    rs: Option<FftFixedInOut<f32>>,
+    pending: [Vec<f32>; 2],
+    in_total: u64,
+    out_total: u64,
+    skip: usize,
+    in_rate: u32,
+}
+
+impl ToOutRate {
+    fn new(in_rate: u32) -> Result<ToOutRate, String> {
+        let rs = if in_rate == OUT_RATE {
+            None
+        } else {
+            Some(
+                FftFixedInOut::<f32>::new(in_rate as usize, OUT_RATE as usize, 1024, 2)
+                    .map_err(|e| format!("resampler: {e}"))?,
+            )
+        };
+        let skip = rs.as_ref().map_or(0, |r| r.output_delay());
+        Ok(ToOutRate {
+            rs,
+            pending: [Vec::new(), Vec::new()],
+            in_total: 0,
+            out_total: 0,
+            skip,
+            in_rate,
+        })
+    }
+
+    fn push(&mut self, stereo: &[f32], clip: &Clip) -> Result<(), String> {
+        self.in_total += stereo.len() as u64 / 2;
+        if self.rs.is_none() {
+            self.out_total += stereo.len() as u64 / 2;
+            return Ok(publish(clip, stereo));
+        }
+        for f in stereo.chunks_exact(2) {
+            self.pending[0].push(f[0]);
+            self.pending[1].push(f[1]);
+        }
+        loop {
+            let rs = self.rs.as_mut().unwrap();
+            let need = rs.input_frames_next();
+            if self.pending[0].len() < need {
+                return Ok(());
+            }
+            let chunk = [&self.pending[0][..need], &self.pending[1][..need]];
+            let out = rs.process(&chunk, None).map_err(|e| format!("resample: {e}"))?;
+            self.pending[0].drain(..need);
+            self.pending[1].drain(..need);
+            self.emit(&out, clip);
         }
     }
-    if clip.rate.load(Ordering::Relaxed) == 0 {
-        return Err("no samples".into());
+
+    fn finish(&mut self, clip: &Clip) -> Result<(), String> {
+        let expected = self.in_total * OUT_RATE as u64 / self.in_rate as u64;
+        if let Some(rs) = self.rs.as_mut() {
+            let rest = [&self.pending[0][..], &self.pending[1][..]];
+            let mut outs = vec![rs.process_partial(Some(&rest), None).map_err(|e| e.to_string())?];
+            // flush the filter tail until every expected frame is out
+            let mut guard = 0;
+            while self.out_total + outs.iter().map(|o| o[0].len() as u64).sum::<u64>()
+                < expected + self.skip as u64
+                && guard < 64
+            {
+                outs.push(rs.process_partial::<&[f32]>(None, None).map_err(|e| e.to_string())?);
+                guard += 1;
+            }
+            for out in outs {
+                let left = expected.saturating_sub(self.out_total) as usize + self.skip;
+                let trimmed: Vec<Vec<f32>> =
+                    out.iter().map(|c| c[..c.len().min(left)].to_vec()).collect();
+                self.emit(&trimmed, clip);
+            }
+        }
+        if clip.rate.load(Ordering::Relaxed) == 0 {
+            return Err("no samples".into());
+        }
+        Ok(())
     }
-    Ok(())
+
+    /// Interleave planar output, drop the filter delay, append.
+    fn emit(&mut self, out: &[Vec<f32>], clip: &Clip) {
+        let n = out[0].len();
+        let start = self.skip.min(n);
+        self.skip -= start;
+        let mut buf = Vec::with_capacity((n - start) * 2);
+        for i in start..n {
+            buf.push(out[0][i]);
+            buf.push(out[1][i]);
+        }
+        self.out_total += (n - start) as u64;
+        publish(clip, &buf);
+    }
+}
+
+fn publish(clip: &Clip, interleaved: &[f32]) {
+    if interleaved.is_empty() {
+        return;
+    }
+    clip.data.write().unwrap().extend_from_slice(interleaved);
+    if clip.rate.load(Ordering::Relaxed) == 0 {
+        clip.rate.store(OUT_RATE, Ordering::Release);
+    }
 }
 
 // ------------------------------------------------------------------ voices
@@ -512,7 +638,19 @@ fn render(v: &mut Voice, out: &mut [f32], master: f32) -> VoiceState {
     VoiceState::Playing
 }
 
-/// 4-point cubic Hermite interpolation.
+/// Transparent below 0.9, then bends smoothly into ±1.0 instead of
+/// hard-clipping loud mixes (master volume > 100 %, several sounds).
+fn soft_clip(x: f32) -> f32 {
+    const K: f32 = 0.9;
+    let a = x.abs();
+    if a <= K {
+        x
+    } else {
+        x.signum() * (K + (1.0 - K) * ((a - K) / (1.0 - K)).tanh())
+    }
+}
+
+/// 4-point cubic Hermite interpolation (only used for speed != 1).
 fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
     let c1 = 0.5 * (y2 - y0);
     let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
@@ -648,6 +786,9 @@ impl Output {
 
     fn run(&mut self, rx: Receiver<MixCmd>) {
         let mut block = vec![0f32; BLOCK * 2];
+        let is_speakers = matches!(self.kind, OutputKind::Speakers(_));
+        // output gain, ramped per block so muting never clicks
+        let mut out_gain = 1.0f32;
         loop {
             // Idle: sleep until something arrives. The stream underruns and
             // restarts instantly thanks to the one-block prebuf.
@@ -689,9 +830,18 @@ impl Output {
                 }
                 alive
             });
-            for s in block.iter_mut() {
-                *s = s.clamp(-1.0, 1.0);
+            let target = if is_speakers && self.shared.speakers_muted.load(Ordering::Relaxed) {
+                0.0
+            } else {
+                1.0
+            };
+            let from = out_gain;
+            for (n, f) in block.chunks_exact_mut(2).enumerate() {
+                let g = from + (target - from) * (n + 1) as f32 / BLOCK as f32;
+                f[0] = soft_clip(f[0] * g);
+                f[1] = soft_clip(f[1] * g);
             }
+            out_gain = target;
 
             let res = match self.stream.as_ref() {
                 Some(stream) => stream.write(bytemuck::cast_slice(&block)),
@@ -783,6 +933,35 @@ mod tests {
         render(&mut v, &mut out, 1.0);
         assert!((v.pos - BLOCK as f64 * 44_100.0 / 48_000.0).abs() < 1e-6);
         assert!(out.iter().all(|s| (s - 0.25).abs() < 1e-5));
+    }
+
+    #[test]
+    fn soft_clip_is_transparent_then_bounded() {
+        assert_eq!(soft_clip(0.5), 0.5);
+        assert_eq!(soft_clip(-0.9), -0.9);
+        assert!(soft_clip(1.5) < 1.0 && soft_clip(1.5) > 0.95);
+        assert!(soft_clip(-3.0) >= -1.0);
+    }
+
+    #[test]
+    fn resampler_keeps_length_and_level() {
+        let clip = Clip::empty();
+        let mut rs = ToOutRate::new(44_100).unwrap();
+        // 1 s of a 1 kHz sine at 44.1 kHz
+        let input: Vec<f32> = (0..44_100)
+            .flat_map(|i| {
+                let v = (i as f32 * 2.0 * std::f32::consts::PI * 1000.0 / 44_100.0).sin() * 0.5;
+                [v, v]
+            })
+            .collect();
+        for chunk in input.chunks(2304) {
+            rs.push(chunk, &clip).unwrap();
+        }
+        rs.finish(&clip).unwrap();
+        let data = clip.data.read().unwrap();
+        assert_eq!(data.len() / 2, 48_000);
+        let peak = data[4800..43200].iter().fold(0f32, |m, s| m.max(s.abs()));
+        assert!((peak - 0.5).abs() < 0.01, "peak {peak}");
     }
 
     #[test]

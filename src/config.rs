@@ -129,6 +129,10 @@ pub struct Settings {
     pub passthrough: bool,
     #[serde(default)]
     pub monitor_locally: bool,
+    /// Play to the virtual mic but keep ASTRA silent in your own
+    /// speakers/headphones.
+    #[serde(default)]
+    pub mute_speakers: bool,
     #[serde(default)]
     pub keep_virtual_mic: bool,
     #[serde(default = "d_true")]

@@ -17,9 +17,22 @@ use crate::ipc::{IpcToUi, PlayEntry, Snapshot};
 use crate::niri;
 use crate::portal::{PortalEvent, PortalHandle};
 
+// Palette: graphite surfaces, one violet accent, red only for stopping.
+const BG: Color32 = Color32::from_rgb(0x0e, 0x0f, 0x14);
+const SURFACE: Color32 = Color32::from_rgb(0x15, 0x17, 0x1f);
+const SURFACE2: Color32 = Color32::from_rgb(0x1d, 0x20, 0x2b);
+const HOVER_BG: Color32 = Color32::from_rgb(0x1a, 0x1c, 0x26);
+const PLAYING_BG: Color32 = Color32::from_rgb(0x1f, 0x1b, 0x36);
+const BORDER: Color32 = Color32::from_rgb(0x26, 0x29, 0x36);
+const TEXT: Color32 = Color32::from_rgb(0xe8, 0xe9, 0xf0);
+const MUTED: Color32 = Color32::from_rgb(0x8a, 0x8f, 0xa3);
 const ACCENT: Color32 = Color32::from_rgb(0x8f, 0x7a, 0xff);
 const ACCENT_DIM: Color32 = Color32::from_rgb(0x3d, 0x35, 0x66);
-const ROW_H: f32 = 34.0;
+const OK: Color32 = Color32::from_rgb(0x46, 0xc3, 0x7b);
+const DANGER: Color32 = Color32::from_rgb(0xe5, 0x48, 0x4d);
+const STOP_IDLE: Color32 = Color32::from_rgb(0x4a, 0x26, 0x2c);
+const ROW_H: f32 = 56.0;
+const SIDE_W: f32 = 252.0;
 const AUDIO_EXTS: &[&str] = &[
     "mp3", "wav", "ogg", "oga", "opus", "flac", "m4a", "m4b", "aac", "aiff", "caf", "wv",
 ];
@@ -39,6 +52,22 @@ pub enum UiBgEvent {
     AddPaths(Vec<String>),
     /// Is anything capturing from the virtual mic?
     MicCapture(bool),
+}
+
+/// Sender for background results that also wakes the UI: egui only runs
+/// `update` on input or repaint, so without this results sat unseen.
+#[derive(Clone)]
+pub struct BgSender {
+    tx: Sender<UiBgEvent>,
+    ctx: egui::Context,
+}
+
+impl BgSender {
+    fn send(&self, ev: UiBgEvent) -> Result<(), mpsc::SendError<UiBgEvent>> {
+        let r = self.tx.send(ev);
+        self.ctx.request_repaint();
+        r
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -107,7 +136,7 @@ pub struct AstraApp {
     dirty: bool,
 
     engine: Engine,
-    bg_tx: Sender<UiBgEvent>,
+    bg_tx: BgSender,
     bg_rx: Receiver<UiBgEvent>,
     ipc_rx: Receiver<IpcToUi>,
     ipc_snapshot: Snapshot,
@@ -136,23 +165,15 @@ pub struct AstraApp {
     pending_delete: Option<PendingDelete>,
     category_dialog: Option<(Option<String>, String)>, // (old name, buffer)
     status: (String, bool),
+    status_at: std::time::Instant,
+    /// Shared with the IPC thread (`astra hear`).
+    speakers_muted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AstraApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = &cc.egui_ctx;
-        ctx.set_visuals(egui::Visuals::dark());
-        ctx.style_mut(|style| {
-            let v = &mut style.visuals;
-            v.panel_fill = Color32::from_rgb(15, 15, 21);
-            v.window_fill = Color32::from_rgb(21, 21, 29);
-            v.extreme_bg_color = Color32::from_rgb(11, 11, 16);
-            v.selection.bg_fill = ACCENT_DIM;
-            v.selection.stroke = egui::Stroke::new(1.2_f32, ACCENT);
-            v.widgets.hovered.bg_fill = Color32::from_rgb(38, 38, 52);
-            v.widgets.active.bg_fill = ACCENT_DIM;
-            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        });
+        apply_theme(ctx);
 
         let cfg = Config::load();
         let lang = cfg.settings.lang.unwrap_or_else(Lang::from_env);
@@ -160,14 +181,21 @@ impl AstraApp {
 
         let engine = Engine::start(cfg.settings.master_volume, cfg.settings.speaker_sink.clone());
 
-        let (bg_tx, bg_rx) = mpsc::channel::<UiBgEvent>();
+        let (bg_raw, bg_rx) = mpsc::channel::<UiBgEvent>();
+        let bg_tx = BgSender { tx: bg_raw, ctx: ctx.clone() };
         let (ipc_tx, ipc_rx) = mpsc::channel::<IpcToUi>();
         let snapshot: Snapshot = Arc::new(Mutex::new(Vec::new()));
 
+        let speakers_muted = Arc::new(std::sync::atomic::AtomicBool::new(cfg.settings.mute_speakers));
+        let _ = engine.tx.send(EngineMsg::SetSpeakersMuted(cfg.settings.mute_speakers));
+        let _ = engine.tx.send(EngineMsg::SetLocalMonitor(
+            cfg.settings.monitor_locally && !cfg.settings.mute_speakers,
+        ));
         crate::ipc::spawn_server(
             engine.tx.clone(),
             ipc_tx,
             snapshot.clone(),
+            speakers_muted.clone(),
             ctx.clone(),
         );
 
@@ -203,6 +231,8 @@ impl AstraApp {
             pending_delete: None,
             category_dialog: None,
             status: (String::new(), true),
+            status_at: std::time::Instant::now(),
+            speakers_muted,
         };
         app.sort = app.cfg.settings.sort;
 
@@ -211,7 +241,7 @@ impl AstraApp {
             let bg = bg_tx.clone();
             let settings_pass = app.cfg.settings.passthrough;
             let src = app.cfg.settings.passthrough_source.clone();
-            let mon = app.cfg.settings.monitor_locally;
+            let mon = app.cfg.settings.monitor_locally && !app.cfg.settings.mute_speakers;
             std::thread::spawn(move || {
                 let ready = mic::ensure_sink().is_ok();
                 let source = mic::ensure_source().is_ok();
@@ -245,6 +275,7 @@ impl AstraApp {
 
     fn set_status(&mut self, msg: impl Into<String>, ok: bool) {
         self.status = (msg.into(), ok);
+        self.status_at = std::time::Instant::now();
     }
 
     fn save(&mut self) {
@@ -429,6 +460,13 @@ impl AstraApp {
                     mic::cleanup_on_exit(self.cfg.settings.keep_virtual_mic);
                     std::process::exit(0);
                 }
+                IpcToUi::SpeakersMuted(m) => {
+                    self.cfg.settings.mute_speakers = m;
+                    self.dirty = true;
+                    if self.cfg.settings.monitor_locally {
+                        self.apply_mic_settings();
+                    }
+                }
                 IpcToUi::Focus => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -541,7 +579,8 @@ impl AstraApp {
         let bg = self.bg_tx.clone();
         let pass = self.cfg.settings.passthrough;
         let src = self.cfg.settings.passthrough_source.clone();
-        let mon = self.cfg.settings.monitor_locally;
+        let mon = self.cfg.settings.monitor_locally && !self.cfg.settings.mute_speakers;
+        let _ = self.engine.tx.send(EngineMsg::SetLocalMonitor(mon));
         std::thread::spawn(move || {
             let ready = mic::ensure_sink().is_ok();
             let source = mic::ensure_source().is_ok();
@@ -808,157 +847,65 @@ impl AstraApp {
 
     // ------------------------------------------------------------ panels
 
-    fn top_panel(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("astra_top").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("ASTRA").strong().size(20.0).color(ACCENT));
-                ui.label(RichText::new(self.t(K::AppTagline)).weak().small());
-
-                ui.separator();
-                let search_hint = self.t(K::Search);
-                let search = ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
-                        .hint_text(search_hint)
-                        .desired_width(220.0),
-                );
-                let _ = search;
-
-                ui.separator();
-                egui::ComboBox::from_id_salt("sort")
-                    .selected_text(sort_name(self.sort, self.lang))
-                    .width(150.0)
-                    .show_ui(ui, |ui| {
-                        for s in [Sort::Manual, Sort::Name, Sort::Added, Sort::RecentlyPlayed, Sort::MostPlayed] {
-                            ui.selectable_value(&mut self.sort, s, sort_name(s, self.lang));
-                        }
-                    });
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button(self.t(K::Settings)).clicked() {
-                        self.settings_open = !self.settings_open;
-                        if self.settings_open && self.devices_cache.is_none() {
-                            self.load_devices();
-                        }
-                    }
-                    if ui.button(self.t(K::AddFolder)).clicked() {
-                        self.add_folder_dialog();
-                    }
-                    if ui.button(self.t(K::AddFiles)).clicked() {
-                        self.add_files_dialog();
-                    }
-                    let stop = egui::Button::new(RichText::new(self.t(K::StopAll)).strong())
-                        .fill(Color32::from_rgb(70, 30, 40));
-                    if ui.add(stop).clicked() {
-                        self.engine.stop_all();
-                    }
-                });
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(self.t(K::Route));
-                let mut r = self.cfg.settings.default_route;
-                let combo = egui::ComboBox::from_id_salt("route")
-                    .selected_text(route_name(r, self.lang))
-                    .width(170.0)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut r, Route::Speakers, route_name(Route::Speakers, self.lang));
-                        ui.selectable_value(&mut r, Route::Mic, route_name(Route::Mic, self.lang));
-                        ui.selectable_value(&mut r, Route::Both, route_name(Route::Both, self.lang));
-                    });
-                if combo.response.changed() {
-                    self.cfg.settings.default_route = r;
-                    self.dirty = true;
-                }
-
-                ui.label(self.t(K::MasterVolume));
-                let mut pct = (self.cfg.settings.master_volume * 100.0).round() as i32;
-                let slider = ui.add(
-                    egui::Slider::new(&mut pct, 0..=150).suffix("%"),
-                );
-                if slider.changed() {
-                    let vol = pct as f32 / 100.0;
-                    self.cfg.settings.master_volume = vol;
-                    self.engine.tx.send(EngineMsg::SetMasterVolume(vol)).ok();
-                    self.dirty = true;
-                }
-
-                ui.separator();
-                let mic_btn_label = format!(
-                    "{}: {}",
-                    self.t(K::VoiceToMic),
-                    if self.passthrough { "ON" } else { "OFF" }
-                );
-                let mic_btn = egui::Button::new(RichText::new(&mic_btn_label).strong()).fill(
-                    if self.passthrough {
-                        ACCENT_DIM
-                    } else {
-                        Color32::from_rgb(40, 40, 48)
-                    },
-                );
-                if ui.add(mic_btn).clicked() {
-                    self.cfg.settings.passthrough = !self.cfg.settings.passthrough;
-                    self.dirty = true;
-                    self.apply_mic_settings();
-                }
-                ui.label(
-                    RichText::new(if self.mic_ready {
-                        self.t(K::MicStatusSink)
-                    } else {
-                        self.t(K::MicStatusNoSink)
-                    })
-                    .weak()
-                    .small(),
-                );
-            });
-            ui.add_space(4.0);
-        });
+    fn view_title(&self) -> String {
+        match &self.side {
+            SideSelection::All => self.t(K::AllSounds).to_string(),
+            SideSelection::Recent => self.t(K::Recent).to_string(),
+            SideSelection::Category(c) => c.clone(),
+        }
     }
 
     fn side_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("astra_side")
-            .default_width(190.0)
+            .exact_width(SIDE_W)
             .resizable(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(SURFACE)
+                    .inner_margin(egui::Margin::symmetric(12.0, 14.0)),
+            )
             .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.heading(self.t(K::Categories));
-                ui.separator();
+                ui.horizontal(|ui| {
+                    star(ui, 22.0);
+                    ui.label(RichText::new("ASTRA").size(20.0).strong().color(TEXT));
+                    ui.label(RichText::new(self.t(K::AppTagline)).size(11.0).color(MUTED));
+                });
+                ui.add_space(18.0);
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let all_count = self.cfg.sounds.len();
-                    if ui
-                        .selectable_label(self.side == SideSelection::All, format!("{} ({all_count})", self.t(K::AllSounds)))
-                        .clicked()
-                    {
+                // mic card pinned to the bottom, the library scrolls above it
+                egui::TopBottomPanel::bottom("astra_side_mic")
+                    .frame(egui::Frame::none())
+                    .show_separator_line(false)
+                    .show_inside(ui, |ui| {
+                        ui.add_space(8.0);
+                        self.mic_card(ui);
+                    });
+
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    section_label(ui, self.t(K::Library));
+                    let all = self.cfg.sounds.len();
+                    if nav_item(ui, "♫", self.t(K::AllSounds), all, self.side == SideSelection::All).clicked() {
                         self.side = SideSelection::All;
                     }
-                    if !self.cfg.recent.is_empty()
-                        && ui
-                            .selectable_label(
-                                self.side == SideSelection::Recent,
-                                format!("{} ({})", self.t(K::Recent), self.cfg.recent.len()),
-                            )
+                    let recent = self.cfg.recent.len();
+                    if recent > 0
+                        && nav_item(ui, "🕘", self.t(K::Recent), recent, self.side == SideSelection::Recent)
                             .clicked()
                     {
                         self.side = SideSelection::Recent;
                     }
-                    ui.add_space(4.0);
 
-                    let cats = self.cfg.categories.clone();
-                    for cat in cats {
+                    ui.add_space(14.0);
+                    section_label(ui, self.t(K::Categories));
+                    for cat in self.cfg.categories.clone() {
                         let count = self
                             .cfg
                             .sounds
                             .iter()
-                            .filter(|s| {
-                                (s.category.is_empty() && cat == "General") || s.category == cat
-                            })
+                            .filter(|s| (s.category.is_empty() && cat == "General") || s.category == cat)
                             .count();
-                        let label = format!("{cat} ({count})");
-                        let resp = ui.selectable_label(
-                            self.side == SideSelection::Category(cat.clone()),
-                            label,
-                        );
+                        let sel = self.side == SideSelection::Category(cat.clone());
+                        let resp = nav_item(ui, "#", &cat, count, sel);
                         if resp.clicked() {
                             self.side = SideSelection::Category(cat.clone());
                         }
@@ -973,146 +920,232 @@ impl AstraApp {
                             }
                         });
                     }
+                    ui.add_space(4.0);
+                    let add = egui::Button::new(
+                        RichText::new(format!("+  {}", self.t(K::NewCategory))).color(MUTED),
+                    )
+                    .frame(false);
+                    if ui.add(add).clicked() {
+                        self.category_dialog = Some((None, String::new()));
+                    }
                 });
+            });
+    }
 
-                ui.separator();
-                ui.add_space(2.0);
-                if ui
-                    .button(format!("＋ {}", self.t(K::NewCategory)))
-                    .clicked()
+    /// Routing card: virtual mic state + the two switches people flip often.
+    fn mic_card(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::none()
+            .fill(SURFACE2)
+            .rounding(12.0)
+            .stroke(egui::Stroke::new(1.0_f32, BORDER))
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let ready = self.mic_ready && self.source_ready;
+                ui.horizontal(|ui| {
+                    status_dot(ui, if ready { OK } else { DANGER });
+                    ui.label(
+                        RichText::new(if ready { self.t(K::MicReady) } else { self.t(K::MicNotReady) })
+                            .strong()
+                            .color(TEXT),
+                    );
+                });
+                ui.label(RichText::new("ASTRA Virtual Microphone").size(11.0).color(MUTED));
+                ui.add_space(10.0);
+
+                let mut hear = !self.cfg.settings.mute_speakers;
+                if switch_row(ui, self.t(K::HearInHeadphones), &mut hear)
+                    .on_hover_text(self.t(K::HearHint))
+                    .changed()
                 {
-                    self.category_dialog = Some((None, String::new()));
+                    self.set_speakers_muted(!hear);
+                }
+                ui.add_space(4.0);
+                let mut pass = self.cfg.settings.passthrough;
+                if switch_row(ui, self.t(K::VoiceToMic), &mut pass).changed() {
+                    self.cfg.settings.passthrough = pass;
+                    self.dirty = true;
+                    self.apply_mic_settings();
                 }
             });
     }
 
-    fn center_panel(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let ids = self.filtered_ids();
-            if ids.is_empty() {
-                ui.add_space(40.0);
-                ui.vertical_centered(|ui| {
-                    ui.heading(RichText::new("✦").color(ACCENT).size(40.0));
-                    ui.heading(self.t(K::NoSounds));
-                    ui.label(
-                        RichText::new(self.t(K::NoSoundsHint))
-                            .weak()
-                            .text_style(egui::TextStyle::Small),
-                    );
-                });
-                return;
-            }
-            ui.label(
-                RichText::new(self.t(K::DoubleClickHint))
-                    .weak()
-                    .text_style(egui::TextStyle::Small),
-            );
-            ui.add_space(2.0);
-            egui::ScrollArea::vertical()
-                .auto_shrink(false)
-                .show_rows(ui, ROW_H + 8.0, ids.len(), |ui, range| {
-                    for &id in &ids[range] {
-                        self.sound_row(ui, id);
+    fn header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(self.view_title()).size(22.0).strong().color(TEXT));
+                let count = self.filtered_ids().len();
+                ui.label(
+                    RichText::new(format!("{count} {}", self.t(K::SoundsCount)))
+                        .size(12.0)
+                        .color(MUTED),
+                );
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let gear = egui::Button::new(RichText::new("⚙").size(18.0))
+                    .min_size(egui::vec2(36.0, 36.0))
+                    .rounding(10.0);
+                if ui.add(gear).on_hover_text(self.t(K::Settings)).clicked() {
+                    self.toggle_settings();
+                }
+                ui.menu_button(RichText::new(format!("+  {}", self.t(K::Add))).strong(), |ui| {
+                    if ui.button(self.t(K::AddFiles)).clicked() {
+                        self.add_files_dialog();
+                        ui.close_menu();
+                    }
+                    if ui.button(self.t(K::AddFolder)).clicked() {
+                        self.add_folder_dialog();
+                        ui.close_menu();
                     }
                 });
+                egui::ComboBox::from_id_salt("sort")
+                    .selected_text(sort_name(self.sort, self.lang))
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        for s in [Sort::Manual, Sort::Name, Sort::Added, Sort::RecentlyPlayed, Sort::MostPlayed] {
+                            ui.selectable_value(&mut self.sort, s, sort_name(s, self.lang));
+                        }
+                    });
+                let hint = format!("🔍  {}", self.t(K::Search));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .hint_text(hint)
+                        .desired_width((ui.available_width() - 8.0).clamp(140.0, 320.0))
+                        .margin(egui::Margin::symmetric(10.0, 8.0)),
+                );
+            });
         });
+        let (msg, ok) = &self.status;
+        if !msg.is_empty() && self.status_at.elapsed() < std::time::Duration::from_secs(8) {
+            ui.add_space(4.0);
+            ui.label(RichText::new(msg.clone()).size(12.0).color(if *ok { OK } else { DANGER }));
+        }
+    }
+
+    fn center_panel(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin::symmetric(20.0, 16.0)))
+            .show(ctx, |ui| {
+                self.header(ui);
+                ui.add_space(12.0);
+                let ids = self.filtered_ids();
+                if ids.is_empty() {
+                    ui.add_space(60.0);
+                    ui.vertical_centered(|ui| {
+                        star(ui, 48.0);
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(self.t(K::NoSounds)).size(18.0).strong().color(TEXT));
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(self.t(K::NoSoundsHint)).color(MUTED));
+                        ui.add_space(14.0);
+                        if ui
+                            .add(accent_button(&format!("+  {}", self.t(K::AddFiles))))
+                            .clicked()
+                        {
+                            self.add_files_dialog();
+                        }
+                    });
+                    return;
+                }
+                let spacing = ui.spacing().item_spacing.y;
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show_rows(ui, ROW_H + spacing, ids.len(), |ui, range| {
+                        for &id in &ids[range] {
+                            self.sound_row(ui, id);
+                        }
+                    });
+            });
     }
 
     fn sound_row(&mut self, ui: &mut egui::Ui, id: u64) {
         let Some(s) = self.cfg.sound(id).cloned() else {
             return;
         };
-        let playing = self.playing.contains_key(&id);
+        let pos = self.playing.get(&id).copied();
+        let playing = pos.is_some();
         let missing = !Path::new(&s.path).exists();
 
-        let frame = egui::Frame::none()
-            .fill(if Some(id) == self.selected {
-                ACCENT_DIM.linear_multiply(0.5)
-            } else if playing {
-                Color32::from_rgb(30, 40, 32)
-            } else {
-                Color32::TRANSPARENT
-            })
-            .inner_margin(egui::Margin::symmetric(6.0, 4.0));
+        // The whole card is clickable (select, double-click plays, right-click
+        // menu); buttons placed on top of it take their own clicks.
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_H), egui::Sense::click());
+        let selected = self.selected == Some(id);
+        let fill = if playing {
+            PLAYING_BG
+        } else if selected {
+            SURFACE2
+        } else if resp.hovered() {
+            HOVER_BG
+        } else {
+            SURFACE
+        };
+        let painter = ui.painter_at(rect);
+        painter.rect(
+            rect,
+            12.0,
+            fill,
+            egui::Stroke::new(1.0_f32, if selected || playing { ACCENT_DIM } else { BORDER }),
+        );
+        if let Some(pos) = pos {
+            let frac = if s.duration_secs > 0.0 { (pos / s.duration_secs).clamp(0.0, 1.0) } else { 1.0 };
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 12.0, rect.bottom() - 4.0),
+                egui::pos2(rect.left() + 12.0 + (rect.width() - 24.0) * frac, rect.bottom() - 2.0),
+            );
+            painter.rect_filled(bar, 1.0, ACCENT);
+        }
 
-        let resp = frame
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.set_min_size(egui::vec2(ui.available_width(), ROW_H));
-                    let play_label = if playing {
-                        self.t(K::Stop)
-                    } else {
-                        self.t(K::Play)
-                    };
-                    let btn = if playing {
-                        egui::Button::new(RichText::new(play_label).strong())
-                            .fill(ACCENT_DIM)
-                            .min_size(egui::vec2(62.0, 24.0))
-                    } else {
-                        egui::Button::new(play_label).min_size(egui::vec2(62.0, 24.0))
-                    };
-                    if ui.add(btn).clicked() {
-                        self.toggle(id);
-                    }
+        let inner = rect.shrink2(egui::vec2(12.0, 6.0));
+        let mut row = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(inner)
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        if play_button(&mut row, playing).clicked() {
+            self.toggle(id);
+        }
+        row.add_space(10.0);
 
-                    let fixed = 250.0;
-                    let name_w = (ui.available_width() - fixed).max(80.0);
-                    let mut name_text = RichText::new(&s.name).strong();
-                    if missing {
-                        name_text = name_text.color(Color32::from_rgb(220, 100, 100));
-                    }
-                    let name_resp = ui.add_sized(
-                        [name_w, 22.0],
-                        egui::Label::new(name_text).truncate(),
-                    );
-                    if name_resp.clicked() {
-                        self.selected = Some(id);
-                    }
+        let right_w = 210.0;
+        let text_w = (row.available_width() - right_w).max(80.0);
+        row.allocate_ui_with_layout(
+            egui::vec2(text_w, inner.height()),
+            Layout::top_down(Align::Min).with_main_justify(false),
+            |ui| {
+                ui.add_space(3.0);
+                let mut name = RichText::new(&s.name).size(15.0).strong().color(TEXT);
+                if missing {
+                    name = name.color(DANGER);
+                }
+                ui.add(egui::Label::new(name).truncate().selectable(false));
+                let route = s.route.resolve(self.cfg.settings.default_route);
+                let mut meta = format!("{}  ·  {}", s.display_duration(), route_icon(route));
+                if (s.speed - 1.0).abs() > 0.01 {
+                    meta.push_str(&format!("  ·  {:.2}×", s.speed));
+                }
+                if s.loop_ {
+                    meta.push_str("  ·  ⟲");
+                }
+                if missing {
+                    meta = format!("{}  ·  {}", self.t(K::Missing), meta);
+                }
+                ui.add(egui::Label::new(RichText::new(meta).size(12.0).color(MUTED)).selectable(false));
+            },
+        );
 
-                    if let Some(pos) = self.playing.get(&id) {
-                        let frac = if s.duration_secs > 0.0 {
-                            (pos / s.duration_secs).clamp(0.0, 1.0)
-                        } else {
-                            1.0
-                        };
-                        ui.add_sized(
-                            [90.0, 6.0],
-                            egui::ProgressBar::new(frac).desired_height(6.0),
-                        );
-                    } else {
-                        ui.label(
-                            RichText::new(s.display_duration())
-                                .weak()
-                                .monospace()
-                                .small(),
-                        );
-                    }
-
-                    if let Some(hk) = &s.hotkey {
-                        ui.label(
-                            RichText::new(hk)
-                                .monospace()
-                                .small()
-                                .background_color(ACCENT_DIM),
-                        );
-                    } else {
-                        ui.label(RichText::new(" ").small());
-                    }
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add(egui::Button::new(RichText::new("×").size(16.0)).small())
-                            .clicked()
-                        {
-                            self.pending_delete = Some(PendingDelete::Sound(id));
-                        }
-                        if ui.add(egui::Button::new("…").small()).clicked() {
-                            self.edit = Some(EditSound::from(&s));
-                        }
-                    });
-                });
-            })
-            .response;
+        row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if icon_button(ui, "🗑").on_hover_text(self.t(K::Delete)).clicked() {
+                self.pending_delete = Some(PendingDelete::Sound(id));
+            }
+            if icon_button(ui, "✏").on_hover_text(self.t(K::Edit)).clicked() {
+                self.edit = Some(EditSound::from(&s));
+            }
+            if let Some(hk) = &s.hotkey {
+                ui.add_space(6.0);
+                chip(ui, hk);
+            }
+        });
 
         if resp.clicked() {
             self.selected = Some(id);
@@ -1136,9 +1169,7 @@ impl AstraApp {
             }
             if ui.button(self.t(K::OpenFolder)).clicked() {
                 if let Some(dir) = Path::new(&s.path).parent() {
-                    let _ = std::process::Command::new("xdg-open")
-                        .arg(dir)
-                        .spawn();
+                    let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
                 }
                 ui.close_menu();
             }
@@ -1150,38 +1181,129 @@ impl AstraApp {
         });
     }
 
-    fn bottom_panel(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("astra_bottom").show(ctx, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                let (msg, ok) = &self.status;
-                let mut text = RichText::new(msg.clone()).small();
-                if !ok {
-                    text = text.color(Color32::from_rgb(240, 120, 120));
-                } else if !msg.is_empty() {
-                    text = text.color(Color32::from_rgb(140, 200, 150));
-                }
-                ui.label(text);
+    /// Bottom transport: what is playing, stop all, route, master volume.
+    fn transport_panel(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("astra_transport")
+            .exact_height(72.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(SURFACE)
+                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                    .inner_margin(egui::Margin::symmetric(18.0, 10.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    // now playing: the most recently started sound
+                    let current = self
+                        .cfg
+                        .recent
+                        .iter()
+                        .find(|id| self.playing.contains_key(id))
+                        .copied()
+                        .or_else(|| self.playing.keys().next().copied());
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(260.0, 48.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.label(RichText::new(self.t(K::NowPlaying).to_uppercase()).size(10.0).color(MUTED));
+                            match current.and_then(|id| self.cfg.sound(id).map(|s| (id, s.clone()))) {
+                                Some((id, s)) => {
+                                    let extra = self.playing.len().saturating_sub(1);
+                                    let mut name = s.name.clone();
+                                    if extra > 0 {
+                                        name.push_str(&format!("  +{extra}"));
+                                    }
+                                    ui.add(egui::Label::new(RichText::new(name).strong().color(TEXT)).truncate());
+                                    let pos = self.playing.get(&id).copied().unwrap_or(0.0);
+                                    let frac = if s.duration_secs > 0.0 {
+                                        (pos / s.duration_secs).clamp(0.0, 1.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    ui.add(
+                                        egui::ProgressBar::new(frac)
+                                            .desired_width(240.0)
+                                            .desired_height(4.0)
+                                            .fill(ACCENT),
+                                    );
+                                }
+                                None => {
+                                    ui.label(RichText::new(self.t(K::Idle)).color(MUTED));
+                                }
+                            }
+                        },
+                    );
 
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(self.portal_status.0.clone())
-                            .small()
-                            .weak(),
-                    );
-                    ui.separator();
-                    let counts = format!(
-                        "{} {} · {} {}",
-                        self.cfg.sounds.len(),
-                        self.t(K::SoundsCount),
-                        self.playing.len(),
-                        self.t(K::PlayingNow)
-                    );
-                    ui.label(RichText::new(counts).weak().small());
+                    ui.add_space(8.0);
+                    let stop = egui::Button::new(
+                        RichText::new(format!("⏹  {}", self.t(K::StopAll))).strong().color(Color32::WHITE),
+                    )
+                    .fill(if self.playing.is_empty() { STOP_IDLE } else { DANGER })
+                    .rounding(10.0)
+                    .min_size(egui::vec2(130.0, 38.0));
+                    if ui.add(stop).clicked() {
+                        self.engine.stop_all();
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let mut pct = (self.cfg.settings.master_volume * 100.0).round() as i32;
+                        ui.spacing_mut().slider_width = 120.0;
+                        if ui
+                            .add(egui::Slider::new(&mut pct, 0..=150).suffix("%"))
+                            .on_hover_text(self.t(K::MasterVolume))
+                            .changed()
+                        {
+                            let vol = pct as f32 / 100.0;
+                            self.cfg.settings.master_volume = vol;
+                            self.engine.tx.send(EngineMsg::SetMasterVolume(vol)).ok();
+                            self.dirty = true;
+                        }
+                        ui.label(RichText::new("🔊").size(16.0).color(MUTED));
+                        ui.add_space(14.0);
+
+                        let mut r = self.cfg.settings.default_route;
+                        let opts = [
+                            (Route::Both, self.t(K::RouteShortBoth)),
+                            (Route::Mic, self.t(K::RouteShortMic)),
+                            (Route::Speakers, self.t(K::RouteShortSpeakers)),
+                        ];
+                        if segmented(ui, &mut r, &opts) {
+                            self.cfg.settings.default_route = r;
+                            self.dirty = true;
+                        }
+                        ui.label(RichText::new(self.t(K::Output)).size(12.0).color(MUTED));
+                    });
                 });
             });
-            ui.add_space(2.0);
-        });
+    }
+
+    fn toggle_settings(&mut self) {
+        if self.settings_open {
+            self.close_settings();
+        } else {
+            self.settings_open = true;
+            if self.devices_cache.is_none() {
+                self.load_devices();
+            }
+        }
+    }
+
+    fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.save();
+        self.rebind_portal();
+    }
+
+    /// Play to the mic but keep ASTRA silent in your own headphones.
+    fn set_speakers_muted(&mut self, muted: bool) {
+        self.cfg.settings.mute_speakers = muted;
+        self.speakers_muted.store(muted, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.engine.tx.send(EngineMsg::SetSpeakersMuted(muted));
+        self.dirty = true;
+        // local monitoring would bring the sounds back into the headphones
+        if self.cfg.settings.monitor_locally {
+            self.apply_mic_settings();
+        }
     }
 
     // ------------------------------------------------------------ windows
@@ -1274,9 +1396,7 @@ impl AstraApp {
                 });
             });
         if !open && self.settings_open {
-            self.settings_open = false;
-            self.save();
-            self.rebind_portal();
+            self.close_settings();
         }
     }
 
@@ -1765,6 +1885,10 @@ impl AstraApp {
         if !open && !close {
             // closed via the [x] decoration
             self.edit = None;
+        } else if !close {
+            // keep what was typed/dragged this frame (handle_keys runs first,
+            // so a captured hotkey is already in this copy)
+            self.edit = Some(edit);
         }
     }
 
@@ -1981,10 +2105,9 @@ impl eframe::App for AstraApp {
             self.save();
         }
 
-        self.top_panel(ctx);
+        self.transport_panel(ctx);
         self.side_panel(ctx);
         self.center_panel(ctx);
-        self.bottom_panel(ctx);
 
         self.settings_window(ctx);
         self.edit_window(ctx);
@@ -1992,7 +2115,10 @@ impl eframe::App for AstraApp {
         self.category_dialog_window(ctx);
 
         if !self.playing.is_empty() || self.capture.is_some() || self.settings_open {
-            ctx.request_repaint_after(std::time::Duration::from_millis(120));
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        } else if !self.status.0.is_empty() {
+            // let the status line disappear on time
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
     }
 
@@ -2063,5 +2189,258 @@ fn collect_audio(path: &Path, depth: u8, out: &mut Vec<PathBuf>) {
         for e in entries {
             collect_audio(&e.path(), depth + 1, out);
         }
+    }
+}
+
+// ---------------------------------------------------------------- theme & widgets
+
+fn apply_theme(ctx: &egui::Context) {
+    ctx.set_visuals(egui::Visuals::dark());
+    ctx.style_mut(|style| {
+        let v = &mut style.visuals;
+        v.panel_fill = BG;
+        v.window_fill = SURFACE;
+        v.window_stroke = egui::Stroke::new(1.0_f32, BORDER);
+        v.window_rounding = egui::Rounding::same(14.0);
+        v.menu_rounding = egui::Rounding::same(10.0);
+        v.extreme_bg_color = Color32::from_rgb(0x0b, 0x0c, 0x10);
+        v.faint_bg_color = SURFACE2;
+        v.override_text_color = None;
+        v.selection.bg_fill = ACCENT_DIM;
+        v.selection.stroke = egui::Stroke::new(1.2_f32, ACCENT);
+        v.hyperlink_color = ACCENT;
+        let round = egui::Rounding::same(8.0);
+        for w in [
+            &mut v.widgets.noninteractive,
+            &mut v.widgets.inactive,
+            &mut v.widgets.hovered,
+            &mut v.widgets.active,
+            &mut v.widgets.open,
+        ] {
+            w.rounding = round;
+        }
+        v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, BORDER);
+        v.widgets.inactive.bg_fill = SURFACE2;
+        v.widgets.inactive.weak_bg_fill = SURFACE2;
+        v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT);
+        v.widgets.hovered.bg_fill = Color32::from_rgb(0x2a, 0x2d, 0x3c);
+        v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x2a, 0x2d, 0x3c);
+        v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT_DIM);
+        v.widgets.active.bg_fill = ACCENT_DIM;
+        v.widgets.active.weak_bg_fill = ACCENT_DIM;
+        v.slider_trailing_fill = true;
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(12.0, 7.0);
+        style.spacing.interact_size.y = 30.0;
+        style.spacing.window_margin = egui::Margin::same(16.0);
+        style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+        style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+        style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
+    });
+}
+
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text.to_uppercase()).size(11.0).color(MUTED));
+    ui.add_space(2.0);
+}
+
+/// Sidebar entry: icon, name, count badge; full-width hit area.
+fn nav_item(ui: &mut egui::Ui, icon: &str, name: &str, count: usize, selected: bool) -> egui::Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
+    let fill = if selected {
+        ACCENT_DIM
+    } else if resp.hovered() {
+        SURFACE2
+    } else {
+        Color32::TRANSPARENT
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, 8.0, fill);
+    let color = if selected { TEXT } else { Color32::from_rgb(0xc4, 0xc7, 0xd4) };
+    p.text(
+        rect.left_center() + egui::vec2(12.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        icon,
+        egui::FontId::proportional(14.0),
+        if selected { ACCENT } else { MUTED },
+    );
+    let name_rect = egui::Rect::from_min_max(
+        rect.left_top() + egui::vec2(34.0, 0.0),
+        rect.right_bottom() - egui::vec2(44.0, 0.0),
+    );
+    let galley = ui.painter().layout(
+        name.to_string(),
+        egui::FontId::proportional(14.0),
+        color,
+        name_rect.width(),
+    );
+    let galley_pos = egui::pos2(name_rect.left(), rect.center().y - galley.size().y / 2.0);
+    ui.painter().with_clip_rect(name_rect).galley(galley_pos, galley, color);
+    ui.painter().text(
+        rect.right_center() - egui::vec2(12.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        count.to_string(),
+        egui::FontId::proportional(12.0),
+        MUTED,
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn status_dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+/// iOS-style switch.
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let size = egui::vec2(36.0, 20.0);
+    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = ui.ctx().animate_bool_responsive(resp.id, *on);
+    let bg = if *on { ACCENT } else { Color32::from_rgb(0x3a, 0x3d, 0x4c) };
+    ui.painter().rect_filled(rect, 10.0, bg);
+    let x = egui::lerp((rect.left() + 10.0)..=(rect.right() - 10.0), t);
+    ui.painter().circle_filled(egui::pos2(x, rect.center().y), 7.5, Color32::WHITE);
+    resp
+}
+
+/// Label + switch on one line; the whole line toggles.
+fn switch_row(ui: &mut egui::Ui, label: &str, on: &mut bool) -> egui::Response {
+    ui.horizontal(|ui| {
+        let text_w = (ui.available_width() - 44.0).max(40.0);
+        let text = ui
+            .allocate_ui(egui::vec2(text_w, 20.0), |ui| {
+                ui.set_width(text_w);
+                ui.add(
+                    egui::Label::new(RichText::new(label).color(TEXT))
+                        .truncate()
+                        .sense(egui::Sense::click())
+                        .selectable(false),
+                )
+            })
+            .inner;
+        let mut resp = ui
+            .with_layout(Layout::right_to_left(Align::Center), |ui| toggle_switch(ui, on))
+            .inner;
+        if text.clicked() {
+            *on = !*on;
+            resp.mark_changed();
+        }
+        resp
+    })
+    .inner
+}
+
+/// Round play / stop button drawn by hand (crisp at any scale).
+fn play_button(ui: &mut egui::Ui, playing: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    let fill = if playing {
+        ACCENT
+    } else if hovered {
+        ACCENT_DIM
+    } else {
+        SURFACE2
+    };
+    let p = ui.painter();
+    p.circle(rect.center(), 18.0, fill, egui::Stroke::new(1.0_f32, if playing { ACCENT } else { BORDER }));
+    let c = rect.center();
+    let fg = if playing || hovered { Color32::WHITE } else { TEXT };
+    if playing {
+        p.rect_filled(egui::Rect::from_center_size(c, egui::vec2(11.0, 11.0)), 2.0, fg);
+    } else {
+        let pts = vec![c + egui::vec2(-4.0, -7.0), c + egui::vec2(-4.0, 7.0), c + egui::vec2(8.0, 0.0)];
+        p.add(egui::Shape::convex_polygon(pts, fg, egui::Stroke::NONE));
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn icon_button(ui: &mut egui::Ui, icon: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(icon).size(15.0).color(MUTED))
+            .frame(false)
+            .min_size(egui::vec2(30.0, 30.0)),
+    )
+}
+
+fn chip(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::none()
+        .fill(SURFACE2)
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .rounding(6.0)
+        .inner_margin(egui::Margin::symmetric(7.0, 3.0))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).monospace().size(12.0).color(Color32::from_rgb(0xc9, 0xc0, 0xff)));
+        });
+}
+
+fn accent_button(text: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text.to_string()).strong().color(Color32::WHITE))
+        .fill(ACCENT)
+        .rounding(10.0)
+        .min_size(egui::vec2(160.0, 38.0))
+}
+
+/// Segmented control; returns true when the value changed. Options are
+/// laid out right-to-left by the caller's layout, so pass them reversed.
+fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) -> bool {
+    let mut changed = false;
+    egui::Frame::none()
+        .fill(SURFACE2)
+        .stroke(egui::Stroke::new(1.0_f32, BORDER))
+        .rounding(10.0)
+        .inner_margin(egui::Margin::same(3.0))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (v, label) in options {
+                let sel = *value == *v;
+                let b = egui::Button::new(RichText::new(*label).color(if sel { Color32::WHITE } else { MUTED }))
+                    .fill(if sel { ACCENT_DIM } else { Color32::TRANSPARENT })
+                    .stroke(egui::Stroke::NONE)
+                    .rounding(8.0);
+                if ui.add(b).clicked() && !sel {
+                    *value = *v;
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
+
+fn route_icon(r: Route) -> &'static str {
+    match r {
+        Route::Speakers => "🔊",
+        Route::Mic => "🎤",
+        Route::Both => "🔊 🎤",
+    }
+}
+
+/// ASTRA's four-point star logo, painted (the font has no ✦ glyph).
+fn star(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let c = rect.center();
+    let r = size * 0.48;
+    let w = size * 0.12;
+    let pts = vec![
+        c + egui::vec2(0.0, -r),
+        c + egui::vec2(w, -w),
+        c + egui::vec2(r, 0.0),
+        c + egui::vec2(w, w),
+        c + egui::vec2(0.0, r),
+        c + egui::vec2(-w, w),
+        c + egui::vec2(-r, 0.0),
+        c + egui::vec2(-w, -w),
+    ];
+    // a concave outline does not fill cleanly: draw the inner square plus
+    // one triangle per arm, all convex
+    let inner = vec![pts[1], pts[3], pts[5], pts[7]];
+    ui.painter().add(egui::Shape::convex_polygon(inner, ACCENT, egui::Stroke::NONE));
+    for i in [0usize, 2, 4, 6] {
+        let arm = vec![pts[(i + 7) % 8], pts[i], pts[i + 1]];
+        ui.painter().add(egui::Shape::convex_polygon(arm, ACCENT, egui::Stroke::NONE));
     }
 }
