@@ -1,6 +1,6 @@
 [package]
 name = "astra"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.78"
 description = "ASTRA — a Soundpad-style soundboard for Linux (PipeWire, Wayland)"
@@ -24,6 +24,7 @@ ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytemuck = "1"
+rubato = "0.16"
 
 [profile.release]
 opt-level = 2

@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -51,6 +52,8 @@ pub enum IpcToUi {
     Reload,
     Quit,
     Focus,
+    /// Headphone mute changed from the CLI (UI persists it).
+    SpeakersMuted(bool),
 }
 
 pub type Snapshot = Arc<Mutex<Vec<PlayEntry>>>;
@@ -71,6 +74,7 @@ pub fn spawn_server(
     engine_tx: Sender<EngineMsg>,
     ui_tx: Sender<IpcToUi>,
     snapshot: Snapshot,
+    muted: Arc<AtomicBool>,
     repaint: eframe::egui::Context,
 ) {
     let path = socket_path();
@@ -87,9 +91,10 @@ pub fn spawn_server(
             let engine_tx = engine_tx.clone();
             let ui_tx = ui_tx.clone();
             let snapshot = snapshot.clone();
+            let muted = muted.clone();
             let repaint = repaint.clone();
             thread::spawn(move || {
-                let _ = handle_conn(stream, engine_tx, ui_tx, snapshot);
+                let _ = handle_conn(stream, engine_tx, ui_tx, snapshot, muted);
                 repaint.request_repaint();
             });
         }
@@ -101,12 +106,13 @@ fn handle_conn(
     engine_tx: Sender<EngineMsg>,
     ui_tx: Sender<IpcToUi>,
     snapshot: Snapshot,
+    muted: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut line = String::new();
     reader.read_line(&mut line).map_err(|e| e.to_string())?;
     let v: Value = serde_json::from_str(line.trim()).map_err(|e| format!("bad request: {e}"))?;
-    let reply = handle_cmd(&v, &engine_tx, &ui_tx, &snapshot);
+    let reply = handle_cmd(&v, &engine_tx, &ui_tx, &snapshot, &muted);
     let mut stream = stream;
     let _ = stream.write_all(reply.as_bytes());
     let _ = stream.flush();
@@ -118,6 +124,7 @@ fn handle_cmd(
     engine_tx: &Sender<EngineMsg>,
     ui_tx: &Sender<IpcToUi>,
     snapshot: &Snapshot,
+    muted: &AtomicBool,
 ) -> String {
     let cmd = v.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
     let entries = snapshot.lock().unwrap().clone();
@@ -161,6 +168,21 @@ fn handle_cmd(
                     "Stopped everything".into()
                 }
             }
+        }
+        "hear" => {
+            let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("status");
+            let cur_hear = !muted.load(Ordering::Relaxed);
+            let hear = match state {
+                "on" => true,
+                "off" => false,
+                "toggle" => !cur_hear,
+                "status" => return format!("hear-in-headphones: {}", if cur_hear { "on" } else { "off" }),
+                other => return format!("ERR unknown state '{other}' (on|off|toggle|status)"),
+            };
+            muted.store(!hear, Ordering::Relaxed);
+            let _ = engine_tx.send(EngineMsg::SetSpeakersMuted(!hear));
+            let _ = ui_tx.send(IpcToUi::SpeakersMuted(!hear));
+            format!("hear-in-headphones: {}", if hear { "on" } else { "off" })
         }
         "stop-all" => {
             let _ = engine_tx.send(EngineMsg::StopAll);
@@ -274,6 +296,7 @@ pub fn client(cmd: crate::Command) -> Result<(), String> {
         crate::Command::List => json!({"cmd": "list"}),
         crate::Command::Add { paths } => json!({"cmd": "add", "paths": paths}),
         crate::Command::Mic { state } => json!({"cmd": "mic", "state": state}),
+        crate::Command::Hear { state } => json!({"cmd": "hear", "state": state}),
         crate::Command::Vol { value } => json!({"cmd": "vol", "value": value}),
         crate::Command::Reload => json!({"cmd": "reload"}),
         crate::Command::Quit => json!({"cmd": "quit"}),

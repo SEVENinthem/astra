@@ -8,7 +8,8 @@ A free, open-source Soundpad alternative for Linux: a soundboard written in Rust
 
 ## Возможности
 
-- ⚡ **Без задержки**: ~10 мс от нажатия до звука в виртуальном микрофоне (было ~2 с в v0.2). Постоянные потоки с буфером 10 мс, свой микшер, кэш декодированных звуков (короткие предзагружаются), виртуальный микрофон внутри графа PipeWire без промежуточных буферов. Проверить у себя: `astra latency`
+- ⚡ **Без задержки**: ~10 мс от нажатия до звука в виртуальном микрофоне (было ~2 с в v0.2). Постоянные потоки с буфером 10 мс, свой микшер, качественный ресемплинг (rubato) в 48 кГц, кэш декодированных звуков (короткие предзагружаются), виртуальный микрофон внутри графа PipeWire без промежуточных буферов. Проверить у себя: `astra latency`
+- 🎧 **«Слышать в наушниках»**: один переключатель — звуки идут в микрофон (их слышат собеседники), но не в ваши наушники. Можно щёлкнуть прямо во время воспроизведения или `astra hear off`
 - 🎵 **Форматы**: MP3, WAV, OGG/Vorbis, FLAC, AAC/M4A (через symphonia)
 - 🎚 **Куда играть**: динамики / виртуальный микрофон / оба — глобально и **персонально для каждого звука**
 - 🎙 **Виртуальный микрофон**: ASTRA создаёт настоящий входной источник `ASTRA Virtual Microphone` (его слышат Discord/Telegram/OBS; внутренний микшер `ASTRA Sounds` при этом просто играет в колонках-«наушниках» в списке вывода — его выбирать не нужно)
@@ -92,6 +93,7 @@ astra stop-all                      остановить всё
 astra list                          список: id, хоткей, имя
 astra add <пути...>                 добавить файлы/папки
 astra mic on|off|toggle|status      сквозной микрофон
+astra hear on|off|toggle|status     слышать звуки в своих наушниках
 astra vol <0..150>                  общая громкость, %
 astra reload                        перечитать конфиг
 astra quit                          закрыть ASTRA
@@ -120,6 +122,7 @@ MIT. Soundpad — товарный знак Leppsoft, ASTRA никак с ним
 
 - **Low latency**: ~10 ms from key press to sound on the virtual mic (persistent 10 ms streams, own mixer, decoded-audio cache with preloading, virtual mic as a PipeWire remap-source with no extra buffering). Measure it with `astra latency`.
 - Plays MP3/WAV/OGG/FLAC/AAC to **speakers**, a **virtual microphone** (`ASTRA Virtual Microphone`, a real input source — pick it in Discord), or both at once.
+- **Hear in headphones** switch: play into the mic without hearing it yourself (`astra hear off`).
 - Microphone passthrough mixes your real mic into the same virtual mic; optional local monitoring.
 - Global hotkeys: XDG GlobalShortcuts portal (GNOME/KDE/niri ≥ 25.02) or generated niri `binds` (auto-inserted into `config.kdl`, validated with `niri validate`, atomic rollback on failure).
 - Categories, search, sorting, drag & drop, per-sound volume / speed (0.5–2×) / loop / normalize / route, stop-others behaviour.
