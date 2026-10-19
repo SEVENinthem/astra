@@ -30,6 +30,21 @@ pub struct PlayEntry {
     pub speed: f32,
 }
 
+impl PlayEntry {
+    pub fn request(&self) -> PlayRequest {
+        PlayRequest {
+            id: self.id,
+            path: self.path.clone(),
+            volume: self.volume,
+            gain: self.gain,
+            route: self.route,
+            loop_: self.loop_,
+            stop_others: self.stop_others,
+            speed: self.speed,
+        }
+    }
+}
+
 /// Messages the IPC server forwards to the UI.
 pub enum IpcToUi {
     Add(Vec<String>),
@@ -121,16 +136,7 @@ fn handle_cmd(
                         let _ = engine_tx.send(EngineMsg::Stop(e.id));
                         format!("Stopped: {}", e.name)
                     } else {
-                        let mut req = PlayRequest {
-                            id: e.id,
-                            path: e.path.clone(),
-                            volume: e.volume,
-                            gain: e.gain,
-                            route: e.route,
-                            loop_: e.loop_,
-                            stop_others: e.stop_others,
-                            speed: e.speed,
-                        };
+                        let mut req = e.request();
                         if let Some(v) = vol {
                             req.volume = (v / 100.0).clamp(0.0, 1.5);
                         }
@@ -272,6 +278,7 @@ pub fn client(cmd: crate::Command) -> Result<(), String> {
         crate::Command::Reload => json!({"cmd": "reload"}),
         crate::Command::Quit => json!({"cmd": "quit"}),
         crate::Command::Focus => json!({"cmd": "focus"}),
+        crate::Command::Latency { .. } => unreachable!("handled locally"),
     };
     let out = send(&v.to_string())?;
     if !out.is_empty() {

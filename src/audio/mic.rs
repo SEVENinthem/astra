@@ -4,10 +4,14 @@
 //!   * `astra_mic` — an internal null *sink*. ASTRA plays sounds into it and
 //!     the microphone passthrough (real mic) is loopbacked into it, so the
 //!     sink's monitor carries the full mix.
-//!   * `astra_virtual_mic` — a *source* (module-pipe-source) fed by the
-//!     bridge thread from that monitor. It is a real input device, so apps
-//!     with Chromium-style monitor filtering (Discord) list it as a
-//!     microphone, unlike the monitor itself.
+//!   * `astra_virtual_mic` — a *source* (module-remap-source) on top of that
+//!     monitor. It is a real input device, so apps with Chromium-style
+//!     monitor filtering (Discord) list it as a microphone, unlike the
+//!     monitor itself. It runs inside the PipeWire graph: no extra thread,
+//!     FIFO or buffering, so it adds no latency.
+//!
+//! Loopbacks (mic passthrough, local monitor) are created with
+//! `latency_msec=LOOPBACK_LATENCY_MS` instead of the 200 ms default.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,6 +22,8 @@ pub const MIC_SOURCE_NAME: &str = "astra_virtual_mic";
 /// NBSP (U+00A0) instead of spaces: the pipewire module arg parser splits
 /// values at plain spaces, NBSP survives and renders as a space everywhere.
 pub const SOURCE_DESCRIPTION: &str = "ASTRA\u{00a0}Virtual\u{00a0}Microphone";
+/// Loopback latency; pulse/pipewire default is 200 ms.
+pub const LOOPBACK_LATENCY_MS: u32 = 10;
 
 fn pactl(args: &[&str]) -> Result<String, String> {
     let out = Command::new("pactl")
@@ -49,7 +55,8 @@ pub fn runtime_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
-pub fn source_fifo() -> PathBuf {
+/// FIFO used by v0.2's pipe-source virtual mic (cleaned up on migration).
+fn legacy_source_fifo() -> PathBuf {
     runtime_dir().join(format!("{MIC_SOURCE_NAME}.pcm"))
 }
 
@@ -147,18 +154,26 @@ pub fn ensure_source() -> Result<(), String> {
         return Err("pactl-not-found".into());
     }
     if source_exists(MIC_SOURCE_NAME) {
-        return Ok(());
+        // v0.2 used a pipe-source fed by a bridge thread (~2 s of latency):
+        // replace it, keep a current remap-source as is.
+        let legacy: Vec<String> = modules()?
+            .into_iter()
+            .filter(|(_, name, args)| name == "module-pipe-source" && args.contains(MIC_SOURCE_NAME))
+            .map(|(idx, _, _)| idx)
+            .collect();
+        if legacy.is_empty() {
+            return Ok(());
+        }
+        for idx in legacy {
+            let _ = pactl(&["unload-module", &idx]);
+        }
+        let _ = std::fs::remove_file(legacy_source_fifo());
     }
-    let fifo = source_fifo();
-    let _ = std::fs::remove_file(&fifo);
     pactl(&[
         "load-module",
-        "module-pipe-source",
+        "module-remap-source",
+        &format!("master={MIC_SINK_NAME}.monitor"),
         &format!("source_name={MIC_SOURCE_NAME}"),
-        &format!("file={}", fifo.display()),
-        "format=s16le",
-        "rate=48000",
-        "channels=2",
         &format!("source_properties=device.description={SOURCE_DESCRIPTION}"),
     ])
     .map(|_| ())
@@ -188,13 +203,14 @@ pub fn destroy_all() {
                     .split_whitespace()
                     .any(|a| a == &format!("source={MIC_SINK_NAME}.monitor"));
             let our_sink = name == "module-null-sink" && args.contains(MIC_SINK_NAME);
-            let our_source = name == "module-pipe-source" && args.contains(MIC_SOURCE_NAME);
+            let our_source = (name == "module-remap-source" || name == "module-pipe-source")
+                && args.contains(MIC_SOURCE_NAME);
             if loopback_into_sink || local_monitor || our_sink || our_source {
                 let _ = pactl(&["unload-module", &idx]);
             }
         }
     }
-    let _ = std::fs::remove_file(source_fifo());
+    let _ = std::fs::remove_file(legacy_source_fifo());
 }
 
 fn modules() -> Result<Vec<(String, String, String)>, String> {
@@ -221,10 +237,18 @@ fn unload_loopbacks_to(sink: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Loopbacks made by older versions lack the latency argument (200 ms
+/// default); treating them as absent makes callers recreate them.
+fn low_latency(args: &str) -> bool {
+    args.split_whitespace()
+        .any(|a| a == format!("latency_msec={LOOPBACK_LATENCY_MS}"))
+}
+
 fn loopback_present(source: Option<&str>, sink: &str) -> bool {
     modules().map_or(false, |mods| {
         mods.iter().any(|(_, name, args)| {
             name == "module-loopback"
+                && low_latency(args)
                 && args.split_whitespace().any(|a| a == &format!("sink={sink}"))
                 && source.map_or(true, |src| {
                     args.split_whitespace().any(|a| a == &format!("source={src}"))
@@ -249,6 +273,7 @@ pub fn set_passthrough(on: bool, source: Option<&str>) -> Result<bool, String> {
             "module-loopback",
             &format!("source={src}"),
             &format!("sink={MIC_SINK_NAME}"),
+            &format!("latency_msec={LOOPBACK_LATENCY_MS}"),
         ])
         .map_err(|e| format!("passthrough: {e}"))?;
         Ok(true)
@@ -272,11 +297,13 @@ pub fn set_local_monitor(on: bool, sink: Option<&str>) -> Result<bool, String> {
         if local_monitor_active() {
             return Ok(true);
         }
+        set_local_monitor(false, None)?; // drop an old high-latency one
         pactl(&[
             "load-module",
             "module-loopback",
             &format!("source={MIC_SINK_NAME}.monitor"),
             &format!("sink={dst}"),
+            &format!("latency_msec={LOOPBACK_LATENCY_MS}"),
         ])
         .map_err(|e| format!("monitor: {e}"))?;
         Ok(true)
@@ -299,6 +326,7 @@ pub fn local_monitor_active() -> bool {
     modules().map_or(false, |mods| {
         mods.iter().any(|(_, name, args)| {
             name == "module-loopback"
+                && low_latency(args)
                 && args
                     .split_whitespace()
                     .any(|a| a == &format!("source={MIC_SINK_NAME}.monitor"))

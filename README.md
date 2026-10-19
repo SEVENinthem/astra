@@ -8,6 +8,7 @@ A free, open-source Soundpad alternative for Linux: a soundboard written in Rust
 
 ## Возможности
 
+- ⚡ **Без задержки**: ~10 мс от нажатия до звука в виртуальном микрофоне (было ~2 с в v0.2). Постоянные потоки с буфером 10 мс, свой микшер, кэш декодированных звуков (короткие предзагружаются), виртуальный микрофон внутри графа PipeWire без промежуточных буферов. Проверить у себя: `astra latency`
 - 🎵 **Форматы**: MP3, WAV, OGG/Vorbis, FLAC, AAC/M4A (через symphonia)
 - 🎚 **Куда играть**: динамики / виртуальный микрофон / оба — глобально и **персонально для каждого звука**
 - 🎙 **Виртуальный микрофон**: ASTRA создаёт настоящий входной источник `ASTRA Virtual Microphone` (его слышат Discord/Telegram/OBS; внутренний микшер `ASTRA Sounds` при этом просто играет в колонках-«наушниках» в списке вывода — его выбирать не нужно)
@@ -94,6 +95,7 @@ astra mic on|off|toggle|status      сквозной микрофон
 astra vol <0..150>                  общая громкость, %
 astra reload                        перечитать конфиг
 astra quit                          закрыть ASTRA
+astra latency [--runs 10]           замер задержки нажатие → виртуальный микрофон (без запущенного окна)
 ```
 
 ## Конфиг
@@ -116,11 +118,12 @@ MIT. Soundpad — товарный знак Leppsoft, ASTRA никак с ним
 
 **ASTRA** is a free, open-source Soundpad alternative for Linux (Rust + egui + PipeWire, Wayland-first: niri / GNOME / KDE / wlroots).
 
-- Plays MP3/WAV/OGG/FLAC/AAC to **speakers**, a **virtual microphone** (PipeWire null-sink, pick it as the input device in Discord), or both at once.
+- **Low latency**: ~10 ms from key press to sound on the virtual mic (persistent 10 ms streams, own mixer, decoded-audio cache with preloading, virtual mic as a PipeWire remap-source with no extra buffering). Measure it with `astra latency`.
+- Plays MP3/WAV/OGG/FLAC/AAC to **speakers**, a **virtual microphone** (`ASTRA Virtual Microphone`, a real input source — pick it in Discord), or both at once.
 - Microphone passthrough mixes your real mic into the same virtual mic; optional local monitoring.
 - Global hotkeys: XDG GlobalShortcuts portal (GNOME/KDE/niri ≥ 25.02) or generated niri `binds` (auto-inserted into `config.kdl`, validated with `niri validate`, atomic rollback on failure).
 - Categories, search, sorting, drag & drop, per-sound volume / speed (0.5–2×) / loop / normalize / route, stop-others behaviour.
 - IPC CLI for scripts and compositor binds: `astra play 3`, `astra stop-all`, `astra mic toggle`, `astra vol 80`…
 - Config: `~/.config/astra/config.json`. Install: `./install.sh` (user-local) or `cargo install --git https://github.com/SEVENinthem/astra`.
 
-Build: `cargo build --release` (needs Rust 1.78+ and gtk3 for the file dialog; no native audio libs required). Runtime needs PipeWire with `pipewire-pulse` and `pactl`. MIT licensed.
+Build: `cargo build --release` (needs Rust 1.78+, gtk3 for the file dialog and libpulse). Runtime needs PipeWire with `pipewire-pulse` and `pactl`. MIT licensed.
