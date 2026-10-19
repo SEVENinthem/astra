@@ -1,12 +1,23 @@
-//! Playback engine: decodes files with symphonia and writes raw samples to
-//! PulseAudio/PipeWire sinks chosen per-sound (speakers and/or virtual mic).
+//! Low-latency playback engine.
+//!
+//! Every output (speakers, virtual mic) has one long-lived PulseAudio/PipeWire
+//! stream and a mixer thread that writes 5 ms blocks into a ~10 ms server
+//! buffer. Pressing a sound only hands a voice to the mixers, so playback
+//! starts in the next block: no thread spawn, no `pactl`, no new connection
+//! and no deep default buffers on the hot path.
+//!
+//! Decoded audio is kept in an LRU cache (short clips are preloaded), so a
+//! repeated or preloaded sound starts without touching the disk. Uncached
+//! files are decoded on a background thread while the voice already plays
+//! whatever has been decoded so far.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use libpulse_binding as pa;
 use libpulse_simple_binding as psimple;
@@ -20,6 +31,19 @@ use symphonia::core::probe::Hint;
 
 use crate::audio::mic;
 use crate::config::Route;
+
+/// Mixer output rate; sounds are resampled on the fly.
+pub const OUT_RATE: u32 = 48_000;
+/// Frames per mixer block (5 ms).
+const BLOCK: usize = 240;
+/// Server-side buffer target (10 ms): the whole output latency budget.
+const TARGET_FRAMES: usize = BLOCK * 2;
+/// Fade-out length on stop, avoids clicks (5 ms).
+const FADE: usize = 240;
+/// Decoded-audio cache budget in samples (f32): 64 Mi samples = 256 MB.
+const CACHE_BUDGET: usize = 64 * 1024 * 1024;
+/// Sounds up to this length are decoded ahead of time.
+pub const PRELOAD_MAX_SECS: f32 = 30.0;
 
 #[derive(Clone, Debug)]
 pub struct PlayRequest {
@@ -38,6 +62,9 @@ pub enum EngineMsg {
     Stop(u64),
     StopAll,
     SetMasterVolume(f32),
+    SetSpeakerSink(Option<String>),
+    /// Decode a file into the cache ahead of time.
+    Preload(String),
     /// Ask whether a sound is currently playing (for `astra toggle`).
     IsPlaying(u64, Sender<bool>),
 }
@@ -50,83 +77,36 @@ pub enum EngineEvent {
     Status(String),
 }
 
-#[derive(Clone, Copy)]
-enum JobCmd {
-    Stop,
-}
-
 pub struct Engine {
     pub tx: Sender<EngineMsg>,
     pub rx: Receiver<EngineEvent>,
-    speaker_sink: Option<String>,
 }
 
 impl Engine {
     pub fn start(master_volume: f32, speaker_sink: Option<String>) -> Engine {
         let (tx, rx) = mpsc::channel();
         let (etx, erx) = mpsc::channel();
-        let master = Arc::new(Mutex::new(master_volume));
-        let jobs: Arc<Mutex<HashMap<u64, Sender<JobCmd>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let shared = Arc::new(Shared {
+            master: AtomicU32::new(master_volume.to_bits()),
+            active: Mutex::new(HashSet::new()),
+            events: Mutex::new(etx),
+        });
+        let cache = Arc::new(Mutex::new(Cache::default()));
 
-        {
-            let jobs = jobs.clone();
-            let etx = etx.clone();
-            let master = master.clone();
-            let speaker_sink = speaker_sink.clone();
-            thread::spawn(move || {
-                for msg in rx {
-                    match msg {
-                        EngineMsg::Play(req) => {
-                            if req.stop_others {
-                                let map = jobs.lock().unwrap();
-                                for (id, jtx) in map.iter() {
-                                    if *id != req.id {
-                                        let _ = jtx.send(JobCmd::Stop);
-                                    }
-                                }
-                            }
-                            let (stop_tx, stop_rx) = mpsc::channel();
-                            // re-pressing a playing sound restarts it
-                            if let Some(old) = jobs.lock().unwrap().insert(req.id, stop_tx) {
-                                let _ = old.send(JobCmd::Stop);
-                            }
-                            let etx = etx.clone();
-                            let master = master.clone();
-                            let speaker_sink = speaker_sink.clone();
-                            thread::spawn(move || run_job(req, etx, master, stop_rx, speaker_sink));
-                        }
-                        EngineMsg::Stop(id) => {
-                            if let Some(jtx) = jobs.lock().unwrap().remove(&id) {
-                                let _ = jtx.send(JobCmd::Stop);
-                            }
-                        }
-                        EngineMsg::StopAll => {
-                            let mut map = jobs.lock().unwrap();
-                            for (_, jtx) in map.drain() {
-                                let _ = jtx.send(JobCmd::Stop);
-                            }
-                        }
-                        EngineMsg::SetMasterVolume(v) => {
-                            *master.lock().unwrap() = v;
-                        }
-                        EngineMsg::IsPlaying(id, reply) => {
-                            let _ = reply.send(jobs.lock().unwrap().contains_key(&id));
-                        }
-                    }
-                }
-                let _ = etx;
-            });
-        }
+        let speakers = Output::spawn(OutputKind::Speakers(speaker_sink), shared.clone());
+        let mic_out = Output::spawn(OutputKind::Mic, shared.clone());
+        let preload = spawn_preloader(cache.clone());
 
-        Engine {
-            tx,
-            rx: erx,
-            speaker_sink,
-        }
+        thread::Builder::new()
+            .name("astra-engine".into())
+            .spawn(move || control(rx, shared, cache, speakers, mic_out, preload))
+            .expect("spawn engine thread");
+
+        Engine { tx, rx: erx }
     }
 
-    pub fn set_speaker_sink(&mut self, sink: Option<String>) {
-        self.speaker_sink = sink;
+    pub fn set_speaker_sink(&self, sink: Option<String>) {
+        let _ = self.tx.send(EngineMsg::SetSpeakerSink(sink));
     }
 
     pub fn play(&self, req: PlayRequest) {
@@ -140,54 +120,219 @@ impl Engine {
     pub fn stop_all(&self) {
         let _ = self.tx.send(EngineMsg::StopAll);
     }
+
+    pub fn preload(&self, path: &str) {
+        let _ = self.tx.send(EngineMsg::Preload(path.to_string()));
+    }
 }
 
-fn run_job(
-    req: PlayRequest,
-    events: Sender<EngineEvent>,
-    master: Arc<Mutex<f32>>,
-    stop_rx: Receiver<JobCmd>,
-    speaker_sink: Option<String>,
+/// State shared by the control thread and the mixers.
+struct Shared {
+    master: AtomicU32,
+    /// Ids with a reporting voice alive somewhere.
+    active: Mutex<HashSet<u64>>,
+    events: Mutex<Sender<EngineEvent>>,
+}
+
+impl Shared {
+    fn emit(&self, ev: EngineEvent) {
+        let _ = self.events.lock().unwrap().send(ev);
+    }
+
+    fn master(&self) -> f32 {
+        f32::from_bits(self.master.load(Ordering::Relaxed))
+    }
+
+    fn finish(&self, id: u64, ev: EngineEvent) {
+        self.active.lock().unwrap().remove(&id);
+        self.emit(ev);
+    }
+}
+
+fn control(
+    rx: Receiver<EngineMsg>,
+    shared: Arc<Shared>,
+    cache: Arc<Mutex<Cache>>,
+    speakers: Sender<MixCmd>,
+    mic_out: Sender<MixCmd>,
+    preload: Sender<String>,
 ) {
-    let _ = events.send(EngineEvent::Started(req.id));
-    let mut played_any = false;
-    loop {
-        if matches!(stop_rx.try_recv(), Ok(JobCmd::Stop)) {
-            break;
-        }
-        match play_once(&req, &events, &master, &stop_rx, speaker_sink.as_deref()) {
-            Ok(()) => {
-                played_any = true;
-                if req.loop_ && !matches!(stop_rx.try_recv(), Ok(JobCmd::Stop)) {
-                    continue;
+    for msg in rx {
+        match msg {
+            EngineMsg::Play(req) => {
+                let clip = Cache::get_or_decode(&cache, &req.path);
+                for out in [&speakers, &mic_out] {
+                    if req.stop_others {
+                        let _ = out.send(MixCmd::StopExcept(req.id));
+                    }
+                    // re-pressing a playing sound restarts it
+                    let _ = out.send(MixCmd::Stop(req.id));
                 }
-                break;
+                // the first target reports progress; for Both that is the
+                // mic, since it is what other people hear
+                let targets: &[&Sender<MixCmd>] = match req.route {
+                    Route::Speakers => &[&speakers],
+                    Route::Mic => &[&mic_out],
+                    Route::Both => &[&mic_out, &speakers],
+                };
+                shared.active.lock().unwrap().insert(req.id);
+                shared.emit(EngineEvent::Started(req.id));
+                for (i, out) in targets.iter().enumerate() {
+                    let _ = out.send(MixCmd::Add(Voice::new(&req, clip.clone(), i == 0)));
+                }
             }
-            Err(e) => {
-                let _ = events.send(EngineEvent::Error(req.id, e));
-                break;
+            EngineMsg::Stop(id) => {
+                let _ = speakers.send(MixCmd::Stop(id));
+                let _ = mic_out.send(MixCmd::Stop(id));
+            }
+            EngineMsg::StopAll => {
+                let _ = speakers.send(MixCmd::StopAll);
+                let _ = mic_out.send(MixCmd::StopAll);
+            }
+            EngineMsg::SetMasterVolume(v) => {
+                shared.master.store(v.to_bits(), Ordering::Relaxed);
+            }
+            EngineMsg::SetSpeakerSink(sink) => {
+                let _ = speakers.send(MixCmd::SetDevice(sink));
+            }
+            EngineMsg::Preload(path) => {
+                let _ = preload.send(path);
+            }
+            EngineMsg::IsPlaying(id, reply) => {
+                let _ = reply.send(shared.active.lock().unwrap().contains(&id));
             }
         }
-    }
-    if played_any {
-        let _ = events.send(EngineEvent::Finished(req.id));
     }
 }
 
-/// Decode the file and write samples to the routed sinks. Returns after EOF
-/// or stop. Errors are strings for easy UI display.
-fn play_once(
-    req: &PlayRequest,
-    events: &Sender<EngineEvent>,
-    master: &Arc<Mutex<f32>>,
-    stop_rx: &Receiver<JobCmd>,
-    speaker_sink: Option<&str>,
-) -> Result<(), String> {
-    let path = Path::new(&req.path);
-    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+// ------------------------------------------------------------------ clips
 
+/// Decoded audio, interleaved stereo at the file's own rate. Filled
+/// progressively by a decoder thread; mixers read what is there so far.
+struct Clip {
+    rate: AtomicU32,
+    data: RwLock<Vec<f32>>,
+    done: AtomicBool,
+    error: Mutex<Option<String>>,
+}
+
+impl Clip {
+    fn empty() -> Clip {
+        Clip {
+            rate: AtomicU32::new(0),
+            data: RwLock::new(Vec::new()),
+            done: AtomicBool::new(false),
+            error: Mutex::new(None),
+        }
+    }
+
+    fn samples(&self) -> usize {
+        self.data.read().unwrap().len()
+    }
+}
+
+#[derive(Default)]
+struct Cache {
+    entries: HashMap<String, CacheEntry>,
+}
+
+struct CacheEntry {
+    clip: Arc<Clip>,
+    mtime: Option<SystemTime>,
+    used: Instant,
+}
+
+fn mtime(path: &str) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+impl Cache {
+    /// Cached clip, or a fresh one being decoded in the background.
+    fn get_or_decode(cache: &Arc<Mutex<Cache>>, path: &str) -> Arc<Clip> {
+        let (clip, fresh) = Cache::lookup(cache, path);
+        if fresh {
+            let c = clip.clone();
+            let p = path.to_string();
+            let cache = cache.clone();
+            thread::spawn(move || {
+                decode_into(&p, &c);
+                cache.lock().unwrap().evict();
+            });
+        }
+        clip
+    }
+
+    /// Returns (clip, needs_decoding).
+    fn lookup(cache: &Arc<Mutex<Cache>>, path: &str) -> (Arc<Clip>, bool) {
+        let mt = mtime(path);
+        let mut c = cache.lock().unwrap();
+        if let Some(e) = c.entries.get_mut(path) {
+            let failed = e.clip.error.lock().unwrap().is_some();
+            if e.mtime == mt && !failed {
+                e.used = Instant::now();
+                return (e.clip.clone(), false);
+            }
+        }
+        let clip = Arc::new(Clip::empty());
+        c.entries.insert(
+            path.to_string(),
+            CacheEntry {
+                clip: clip.clone(),
+                mtime: mt,
+                used: Instant::now(),
+            },
+        );
+        (clip, true)
+    }
+
+    /// Drop least recently used clips that nobody plays until under budget.
+    fn evict(&mut self) {
+        let mut total: usize = self.entries.values().map(|e| e.clip.samples()).sum();
+        while total > CACHE_BUDGET {
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(_, e)| Arc::strong_count(&e.clip) == 1)
+                .min_by_key(|(_, e)| e.used)
+                .map(|(k, _)| k.clone());
+            let Some(k) = victim else { break };
+            if let Some(e) = self.entries.remove(&k) {
+                total -= e.clip.samples();
+            }
+        }
+    }
+}
+
+fn spawn_preloader(cache: Arc<Mutex<Cache>>) -> Sender<String> {
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::Builder::new()
+        .name("astra-preload".into())
+        .spawn(move || {
+            for path in rx {
+                let (clip, fresh) = Cache::lookup(&cache, &path);
+                if fresh {
+                    decode_into(&path, &clip);
+                    cache.lock().unwrap().evict();
+                }
+            }
+        })
+        .expect("spawn preload thread");
+    tx
+}
+
+/// Decode a whole file into `clip` (stereo f32), publishing as it goes.
+fn decode_into(path: &str, clip: &Clip) {
+    if let Err(e) = decode_inner(path, clip) {
+        *clip.error.lock().unwrap() = Some(e);
+    }
+    clip.done.store(true, Ordering::Release);
+}
+
+fn decode_inner(path: &str, clip: &Clip) -> Result<(), String> {
+    let p = Path::new(path);
+    let file = std::fs::File::open(p).map_err(|e| format!("open: {e}"))?;
     let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+    if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -195,44 +340,29 @@ fn play_once(
         .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
         .map_err(|e| format!("probe: {e}"))?;
     let mut format = probed.format;
-
     let track = format
         .tracks()
         .iter()
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
         .ok_or("no audio track")?;
     let track_id = track.id;
+    // Reserve up front: growing the Vec later would hold the write lock
+    // during a big copy while mixers wait to read.
+    if let Some(n) = track.codec_params.n_frames {
+        clip.data.write().unwrap().reserve(n as usize * 2 + 8192);
+    }
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| format!("decoder: {e}"))?;
 
-    // Streams are created lazily once we know the real sample spec.
-    let mut writers: Vec<psimple::Simple> = Vec::new();
-    let mut sample_buf: Option<SampleBuffer<f32>> = None;
-    let mut base_rate: u32 = 48_000;
-    let mut channels: usize = 2;
-    let mut frames_written: u64 = 0;
-    let mut last_progress = Instant::now();
-    let speed = req.speed.clamp(0.25, 4.0);
-
+    let mut sample_buf: Option<(SampleBuffer<f32>, usize)> = None;
+    let mut stereo: Vec<f32> = Vec::new();
     loop {
-        if matches!(stop_rx.try_recv(), Ok(JobCmd::Stop)) {
-            for w in &writers {
-                let _ = w.flush();
-            }
-            return Ok(());
-        }
-
         let packet = match format.next_packet() {
             Ok(p) => p,
             Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(SymError::ResetRequired) => break,
-            Err(e) => {
-                for w in &writers {
-                    let _ = w.flush();
-                }
-                return Err(format!("read: {e}"));
-            }
+            Err(e) => return Err(format!("read: {e}")),
         };
         if packet.track_id() != track_id {
             continue;
@@ -240,109 +370,432 @@ fn play_once(
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
             Err(SymError::DecodeError(_)) => continue,
-            Err(e) => {
-                for w in &writers {
-                    let _ = w.flush();
-                }
-                return Err(format!("decode: {e}"));
-            }
+            Err(e) => return Err(format!("decode: {e}")),
         };
-
-        if sample_buf.is_none() {
-            let spec = *decoded.spec();
-            base_rate = spec.rate;
-            channels = spec.channels.count();
-            let out_rate = (base_rate as f32 * speed).round() as u32;
-            let pspec = pa::sample::Spec {
-                format: pa::sample::Format::F32le,
-                rate: out_rate,
-                channels: channels as u8,
-            };
-            if !pspec.is_valid() {
-                return Err("invalid sample spec".into());
-            }
-            let open = |dev: Option<&str>| -> Result<psimple::Simple, String> {
-                psimple::Simple::new(
-                    None,
-                    "astra",
-                    pa::stream::Direction::Playback,
-                    dev,
-                    "ASTRA playback",
-                    &pspec,
-                    None,
-                    None,
-                )
-                .map_err(|e| match dev {
-                    Some(d) => format!("pulse ({d}): {e}"),
-                    None => format!("pulse (default): {e}"),
-                })
-            };
-            match req.route {
-                Route::Speakers => writers.push(open(speaker_sink)?),
-                Route::Mic => {
-                    if !mic::sink_exists(mic::MIC_SINK_NAME) {
-                        mic::ensure_sink()?;
-                    }
-                    writers.push(open(Some(mic::MIC_SINK_NAME))?);
-                }
-                Route::Both => {
-                    if !mic::sink_exists(mic::MIC_SINK_NAME) {
-                        mic::ensure_sink()?;
-                    }
-                    // Try mic first; if it fails, at least play on speakers.
-                    match open(Some(mic::MIC_SINK_NAME)) {
-                        Ok(w) => writers.push(w),
-                        Err(e) => {
-                            let _ = events.send(EngineEvent::Status(format!("virtual mic: {e}")));
-                        }
-                    }
-                    match open(speaker_sink) {
-                        Ok(w) => writers.push(w),
-                        Err(e) => {
-                            let _ = events.send(EngineEvent::Status(format!("speakers: {e}")));
-                        }
-                    }
-                    if writers.is_empty() {
-                        return Err("no output could be opened".into());
-                    }
-                }
-            }
-            sample_buf = Some(SampleBuffer::<f32>::new(
-                decoded.capacity() as u64,
-                *decoded.spec(),
-            ));
+        let spec = *decoded.spec();
+        let channels = spec.channels.count().max(1);
+        let frames_cap = decoded.capacity();
+        if sample_buf.as_ref().map_or(true, |(_, cap)| *cap < frames_cap) {
+            sample_buf = Some((SampleBuffer::<f32>::new(frames_cap as u64, spec), frames_cap));
         }
-
-        let sb = sample_buf.as_mut().unwrap();
+        let sb = &mut sample_buf.as_mut().unwrap().0;
         sb.copy_interleaved_ref(decoded);
-        let vol = req.volume * req.gain * (*master.lock().unwrap());
-        let scaled: Vec<f32> = if (vol - 1.0).abs() < 1e-4 {
-            sb.samples().to_vec()
-        } else {
-            sb.samples().iter().map(|s| s * vol).collect()
-        };
-        let bytes: &[u8] = bytemuck::cast_slice(&scaled);
-        if bytes.is_empty() {
-            continue;
-        }
-        for w in &writers {
-            w.write(bytes).map_err(|e| format!("pulse write: {e}"))?;
-        }
-        frames_written += (scaled.len() / channels.max(1)) as u64;
 
-        if last_progress.elapsed() > Duration::from_millis(200) {
-            let secs = frames_written as f32 / base_rate as f32;
-            let _ = events.send(EngineEvent::Progress(req.id, secs));
-            last_progress = Instant::now();
+        stereo.clear();
+        for frame in sb.samples().chunks_exact(channels) {
+            let (l, r) = if channels == 1 { (frame[0], frame[0]) } else { (frame[0], frame[1]) };
+            stereo.push(l);
+            stereo.push(r);
+        }
+        clip.data.write().unwrap().extend_from_slice(&stereo);
+        if clip.rate.load(Ordering::Relaxed) == 0 {
+            clip.rate.store(spec.rate, Ordering::Release);
         }
     }
-
-    for w in &writers {
-        let _ = w.drain();
+    if clip.rate.load(Ordering::Relaxed) == 0 {
+        return Err("no samples".into());
     }
-    let _ = events.send(EngineEvent::Progress(
-        req.id,
-        frames_written as f32 / base_rate as f32,
-    ));
     Ok(())
+}
+
+// ------------------------------------------------------------------ voices
+
+struct Voice {
+    id: u64,
+    clip: Arc<Clip>,
+    /// Position in source frames (fractional, for resampling/speed).
+    pos: f64,
+    speed: f64,
+    gain: f32,
+    loop_: bool,
+    /// Only one copy of a voice (per press) reports to the UI.
+    report: bool,
+    /// Remaining fade-out frames once stopping.
+    fade: Option<usize>,
+    last_progress: Instant,
+}
+
+impl Voice {
+    fn new(req: &PlayRequest, clip: Arc<Clip>, report: bool) -> Voice {
+        Voice {
+            id: req.id,
+            clip,
+            pos: 0.0,
+            speed: req.speed.clamp(0.25, 4.0) as f64,
+            gain: req.volume * req.gain,
+            loop_: req.loop_,
+            report,
+            fade: None,
+            last_progress: Instant::now(),
+        }
+    }
+
+    fn stop(&mut self) {
+        if self.fade.is_none() {
+            self.fade = Some(FADE);
+        }
+    }
+}
+
+enum VoiceState {
+    Playing,
+    Finished,
+    Failed(String),
+}
+
+/// Mix one voice into `out` (stereo interleaved).
+fn render(v: &mut Voice, out: &mut [f32], master: f32) -> VoiceState {
+    let rate = v.clip.rate.load(Ordering::Acquire);
+    if rate == 0 {
+        if v.clip.done.load(Ordering::Acquire) {
+            let err = v.clip.error.lock().unwrap().clone();
+            return VoiceState::Failed(err.unwrap_or_else(|| "no samples".into()));
+        }
+        // still opening the file: stay silent this block
+        return if v.fade.is_some() { VoiceState::Finished } else { VoiceState::Playing };
+    }
+    let done = v.clip.done.load(Ordering::Acquire);
+    // never stall the mixer behind the decoder's write lock
+    let Ok(data) = v.clip.data.try_read() else {
+        return VoiceState::Playing;
+    };
+    let frames = data.len() / 2;
+    let step = rate as f64 / OUT_RATE as f64 * v.speed;
+    let gain = v.gain * master;
+
+    for o in out.chunks_exact_mut(2) {
+        let mut i = v.pos as usize;
+        if i + 2 >= frames {
+            if !done {
+                break; // decoder is behind (only right after start)
+            }
+            if i >= frames {
+                if v.loop_ && frames > 0 && v.fade.is_none() {
+                    v.pos -= frames as f64;
+                    i = v.pos as usize;
+                } else {
+                    return VoiceState::Finished;
+                }
+            }
+        }
+        let mut g = gain;
+        if let Some(f) = v.fade.as_mut() {
+            if *f == 0 {
+                return VoiceState::Finished;
+            }
+            g *= *f as f32 / FADE as f32;
+            *f -= 1;
+        }
+        let t = (v.pos - i as f64) as f32;
+        let at = |k: isize, ch: usize| -> f32 {
+            // hold the first sample before the start, silence past the end
+            let idx = (i as isize + k).max(0) as usize;
+            if idx >= frames {
+                0.0
+            } else {
+                data[idx * 2 + ch]
+            }
+        };
+        for ch in 0..2 {
+            let s = if t == 0.0 {
+                at(0, ch)
+            } else {
+                hermite(at(-1, ch), at(0, ch), at(1, ch), at(2, ch), t)
+            };
+            o[ch] += s * g;
+        }
+        v.pos += step;
+    }
+    if v.fade == Some(0) {
+        return VoiceState::Finished;
+    }
+    VoiceState::Playing
+}
+
+/// 4-point cubic Hermite interpolation.
+fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
+    let c1 = 0.5 * (y2 - y0);
+    let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+    let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+    ((c3 * t + c2) * t + c1) * t + y1
+}
+
+// ------------------------------------------------------------------ outputs
+
+enum MixCmd {
+    Add(Voice),
+    Stop(u64),
+    StopExcept(u64),
+    StopAll,
+    SetDevice(Option<String>),
+}
+
+enum OutputKind {
+    Speakers(Option<String>),
+    Mic,
+}
+
+struct Output {
+    kind: OutputKind,
+    stream: Option<psimple::Simple>,
+    voices: Vec<Voice>,
+    shared: Arc<Shared>,
+}
+
+impl Output {
+    fn spawn(kind: OutputKind, shared: Arc<Shared>) -> Sender<MixCmd> {
+        let (tx, rx) = mpsc::channel();
+        let name = match kind {
+            OutputKind::Speakers(_) => "astra-mix-spk",
+            OutputKind::Mic => "astra-mix-mic",
+        };
+        thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let mut out = Output {
+                    kind,
+                    stream: None,
+                    voices: Vec::new(),
+                    shared,
+                };
+                // connect up front so the first press is instant
+                let _ = out.open();
+                out.run(rx);
+            })
+            .expect("spawn mixer thread");
+        tx
+    }
+
+    fn device(&self) -> Option<String> {
+        match &self.kind {
+            OutputKind::Speakers(s) => s.clone(),
+            OutputKind::Mic => Some(mic::MIC_SINK_NAME.to_string()),
+        }
+    }
+
+    fn open(&mut self) -> Result<(), String> {
+        if self.stream.is_some() {
+            return Ok(());
+        }
+        if matches!(self.kind, OutputKind::Mic) && !mic::sink_exists(mic::MIC_SINK_NAME) {
+            mic::ensure_sink()?;
+        }
+        let spec = pa::sample::Spec {
+            format: pa::sample::Format::F32le,
+            rate: OUT_RATE,
+            channels: 2,
+        };
+        let frame = spec.frame_size() as u32;
+        let attr = pa::def::BufferAttr {
+            maxlength: u32::MAX,
+            tlength: TARGET_FRAMES as u32 * frame,
+            // start the moment the first block arrives (also after idle)
+            prebuf: BLOCK as u32 * frame,
+            minreq: BLOCK as u32 * frame,
+            fragsize: u32::MAX,
+        };
+        let dev = self.device();
+        let stream = psimple::Simple::new(
+            None,
+            "ASTRA",
+            pa::stream::Direction::Playback,
+            dev.as_deref(),
+            match self.kind {
+                OutputKind::Speakers(_) => "ASTRA speakers",
+                OutputKind::Mic => "ASTRA virtual mic",
+            },
+            &spec,
+            None,
+            Some(&attr),
+        )
+        .map_err(|e| match &dev {
+            Some(d) => format!("pulse ({d}): {e}"),
+            None => format!("pulse (default): {e}"),
+        })?;
+        self.stream = Some(stream);
+        Ok(())
+    }
+
+    fn handle(&mut self, cmd: MixCmd) {
+        match cmd {
+            MixCmd::Add(v) => {
+                if let Err(e) = self.open() {
+                    if v.report {
+                        self.shared.finish(v.id, EngineEvent::Error(v.id, e));
+                    } else {
+                        self.shared.emit(EngineEvent::Status(e));
+                    }
+                    return;
+                }
+                self.voices.push(v);
+            }
+            MixCmd::Stop(id) => self.voices.iter_mut().filter(|v| v.id == id).for_each(Voice::stop),
+            MixCmd::StopExcept(id) => {
+                self.voices.iter_mut().filter(|v| v.id != id).for_each(Voice::stop)
+            }
+            MixCmd::StopAll => self.voices.iter_mut().for_each(Voice::stop),
+            MixCmd::SetDevice(dev) => {
+                if let OutputKind::Speakers(cur) = &mut self.kind {
+                    if *cur != dev {
+                        *cur = dev;
+                        self.stream = None;
+                        let _ = self.open();
+                    }
+                }
+            }
+        }
+    }
+
+    fn run(&mut self, rx: Receiver<MixCmd>) {
+        let mut block = vec![0f32; BLOCK * 2];
+        loop {
+            // Idle: sleep until something arrives. The stream underruns and
+            // restarts instantly thanks to the one-block prebuf.
+            if self.voices.is_empty() {
+                match rx.recv() {
+                    Ok(cmd) => self.handle(cmd),
+                    Err(_) => return,
+                }
+            }
+            loop {
+                match rx.try_recv() {
+                    Ok(cmd) => self.handle(cmd),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => return,
+                }
+            }
+            if self.voices.is_empty() {
+                continue;
+            }
+
+            block.iter_mut().for_each(|s| *s = 0.0);
+            let master = self.shared.master();
+            let shared = &self.shared;
+            self.voices.retain_mut(|v| {
+                let state = render(v, &mut block, master);
+                let alive = matches!(state, VoiceState::Playing);
+                if v.report {
+                    match state {
+                        VoiceState::Playing => {
+                            if v.last_progress.elapsed() > Duration::from_millis(100) {
+                                let rate = v.clip.rate.load(Ordering::Relaxed).max(1);
+                                shared.emit(EngineEvent::Progress(v.id, v.pos as f32 / rate as f32));
+                                v.last_progress = Instant::now();
+                            }
+                        }
+                        VoiceState::Finished => shared.finish(v.id, EngineEvent::Finished(v.id)),
+                        VoiceState::Failed(e) => shared.finish(v.id, EngineEvent::Error(v.id, e)),
+                    }
+                }
+                alive
+            });
+            for s in block.iter_mut() {
+                *s = s.clamp(-1.0, 1.0);
+            }
+
+            let res = match self.stream.as_ref() {
+                Some(stream) => stream.write(bytemuck::cast_slice(&block)),
+                None => Ok(()),
+            };
+            if let Err(e) = res {
+                // the device went away: reconnect, dropping what was playing
+                self.stream = None;
+                self.shared.emit(EngineEvent::Status(format!("pulse write: {e}")));
+                for v in self.voices.drain(..).filter(|v| v.report) {
+                    self.shared.finish(v.id, EngineEvent::Finished(v.id));
+                }
+                match rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(cmd) => self.handle(cmd),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
+                let _ = self.open();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clip_with(rate: u32, frames: &[f32]) -> Arc<Clip> {
+        let c = Clip::empty();
+        c.rate.store(rate, Ordering::Relaxed);
+        *c.data.write().unwrap() = frames.iter().flat_map(|&s| [s, s]).collect();
+        c.done.store(true, Ordering::Relaxed);
+        Arc::new(c)
+    }
+
+    fn voice(clip: Arc<Clip>) -> Voice {
+        let req = PlayRequest {
+            id: 1,
+            path: String::new(),
+            volume: 1.0,
+            gain: 1.0,
+            route: Route::Mic,
+            loop_: false,
+            stop_others: false,
+            speed: 1.0,
+        };
+        Voice::new(&req, clip, true)
+    }
+
+    #[test]
+    fn plays_first_sample_in_first_block() {
+        let mut v = voice(clip_with(OUT_RATE, &vec![0.5; 1000]));
+        let mut out = vec![0f32; BLOCK * 2];
+        assert!(matches!(render(&mut v, &mut out, 1.0), VoiceState::Playing));
+        assert_eq!(out[0], 0.5);
+        assert_eq!(out[1], 0.5);
+    }
+
+    #[test]
+    fn finishes_at_end() {
+        let mut v = voice(clip_with(OUT_RATE, &vec![0.5; 100]));
+        let mut out = vec![0f32; BLOCK * 2];
+        assert!(matches!(render(&mut v, &mut out, 1.0), VoiceState::Finished));
+    }
+
+    #[test]
+    fn loops_back_to_start() {
+        let mut v = voice(clip_with(OUT_RATE, &vec![0.5; 100]));
+        v.loop_ = true;
+        let mut out = vec![0f32; BLOCK * 2];
+        assert!(matches!(render(&mut v, &mut out, 1.0), VoiceState::Playing));
+        assert!(v.pos < 100.0);
+    }
+
+    #[test]
+    fn stop_fades_out() {
+        let mut v = voice(clip_with(OUT_RATE, &vec![1.0; 10_000]));
+        v.stop();
+        let mut out = vec![0f32; BLOCK * 2];
+        let st = render(&mut v, &mut out, 1.0);
+        assert!(matches!(st, VoiceState::Finished));
+        assert!(out[0] > 0.9 && out[(FADE - 1) * 2] < 0.01);
+    }
+
+    #[test]
+    fn resamples_44k() {
+        let mut v = voice(clip_with(44_100, &vec![0.25; 44_100]));
+        let mut out = vec![0f32; BLOCK * 2];
+        render(&mut v, &mut out, 1.0);
+        assert!((v.pos - BLOCK as f64 * 44_100.0 / 48_000.0).abs() < 1e-6);
+        assert!(out.iter().all(|s| (s - 0.25).abs() < 1e-5));
+    }
+
+    #[test]
+    fn waits_for_decoder_without_skipping() {
+        let c = Clip::empty();
+        let clip = Arc::new(c);
+        let mut v = voice(clip.clone());
+        let mut out = vec![0f32; BLOCK * 2];
+        assert!(matches!(render(&mut v, &mut out, 1.0), VoiceState::Playing));
+        assert_eq!(v.pos, 0.0);
+        clip.rate.store(OUT_RATE, Ordering::Relaxed);
+        clip.data.write().unwrap().extend_from_slice(&[0.7; 4000]);
+        render(&mut v, &mut out, 1.0);
+        assert_eq!(out[0], 0.7);
+    }
 }

@@ -11,7 +11,6 @@ use futures_util::StreamExt;
 pub enum PortalEvent {
     /// (message, ok)
     Status(String, bool),
-    Activated(String),
 }
 
 pub struct PortalHandle {
@@ -28,7 +27,15 @@ impl Drop for PortalHandle {
 
 /// Spawn the portal worker. `bindings` is a list of
 /// (shortcut id, trigger, description).
-pub fn start(bindings: Vec<(String, String, String)>, events: Sender<PortalEvent>) -> PortalHandle {
+/// `on_activate` runs on the portal thread with the shortcut id.
+pub fn start<F>(
+    bindings: Vec<(String, String, String)>,
+    events: Sender<PortalEvent>,
+    on_activate: F,
+) -> PortalHandle
+where
+    F: Fn(&str) + Send + 'static,
+{
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
@@ -41,7 +48,7 @@ pub fn start(bindings: Vec<(String, String, String)>, events: Sender<PortalEvent
         rt.block_on(async move {
             tokio::select! {
                 _ = stop_rx => {}
-                _ = run_session(bindings, events) => {}
+                _ = run_session(bindings, events, on_activate) => {}
             }
         });
     });
@@ -50,7 +57,11 @@ pub fn start(bindings: Vec<(String, String, String)>, events: Sender<PortalEvent
     }
 }
 
-async fn run_session(bindings: Vec<(String, String, String)>, events: Sender<PortalEvent>) {
+async fn run_session<F: Fn(&str)>(
+    bindings: Vec<(String, String, String)>,
+    events: Sender<PortalEvent>,
+    on_activate: F,
+) {
     use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
 
     let setup = async {
@@ -97,7 +108,7 @@ async fn run_session(bindings: Vec<(String, String, String)>, events: Sender<Por
 
     let _ = events.send(PortalEvent::Status(String::new(), true));
     while let Some(activated) = stream.next().await {
-        let _ = events.send(PortalEvent::Activated(activated.shortcut_id().to_string()));
+        on_activate(activated.shortcut_id());
     }
     let _ = session.close().await;
 }
