@@ -9,7 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use eframe::egui;
 use egui::{Align, Color32, Layout, RichText};
 
-use crate::audio::engine::{Engine, EngineEvent, EngineMsg, PlayRequest, PRELOAD_MAX_SECS};
+use crate::audio::engine::{
+    Engine, EngineEvent, EngineMsg, PlayRequest, BASS_MAX_DB, BASS_MIN_DB, PRELOAD_MAX_SECS,
+};
 use crate::audio::{mic, scan};
 use crate::config::{hotkey, Config, Route, RouteOverride, Sort, Sound};
 use crate::i18n::{tr, K, Lang};
@@ -188,6 +190,7 @@ impl AstraApp {
 
         let speakers_muted = Arc::new(std::sync::atomic::AtomicBool::new(cfg.settings.mute_speakers));
         let _ = engine.tx.send(EngineMsg::SetSpeakersMuted(cfg.settings.mute_speakers));
+        let _ = engine.tx.send(EngineMsg::SetBass(cfg.settings.bass_db));
         let _ = engine.tx.send(EngineMsg::SetLocalMonitor(
             cfg.settings.monitor_locally && !cfg.settings.mute_speakers,
         ));
@@ -459,6 +462,15 @@ impl AstraApp {
                     self.save();
                     mic::cleanup_on_exit(self.cfg.settings.keep_virtual_mic);
                     std::process::exit(0);
+                }
+                IpcToUi::Passthrough(on) => {
+                    self.cfg.settings.passthrough = on;
+                    self.passthrough = on;
+                    self.dirty = true;
+                }
+                IpcToUi::Bass(db) => {
+                    self.cfg.settings.bass_db = db;
+                    self.dirty = true;
                 }
                 IpcToUi::SpeakersMuted(m) => {
                     self.cfg.settings.mute_speakers = m;
@@ -1259,6 +1271,27 @@ impl AstraApp {
                             self.dirty = true;
                         }
                         ui.label(RichText::new("🔊").size(16.0).color(MUTED));
+                        ui.add_space(14.0);
+
+                        let mut db = self.cfg.settings.bass_db.round() as i32;
+                        ui.spacing_mut().slider_width = 100.0;
+                        let bass = ui
+                            .add(
+                                egui::Slider::new(&mut db, BASS_MIN_DB as i32..=BASS_MAX_DB as i32)
+                                    .suffix(" dB"),
+                            )
+                            .on_hover_text("0 dB = flat · double-click: reset");
+                        if bass.changed() {
+                            self.cfg.settings.bass_db = db as f32;
+                            self.engine.tx.send(EngineMsg::SetBass(db as f32)).ok();
+                            self.dirty = true;
+                        }
+                        if bass.double_clicked() {
+                            self.cfg.settings.bass_db = 0.0;
+                            self.engine.tx.send(EngineMsg::SetBass(0.0)).ok();
+                            self.dirty = true;
+                        }
+                        ui.label(RichText::new(self.t(K::Bass)).size(12.0).color(MUTED));
                         ui.add_space(14.0);
 
                         let mut r = self.cfg.settings.default_route;

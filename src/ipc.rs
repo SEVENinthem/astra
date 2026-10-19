@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::audio::engine::{EngineMsg, PlayRequest};
+use crate::audio::engine::{EngineMsg, PlayRequest, BASS_MAX_DB, BASS_MIN_DB};
 use crate::config::Route;
 
 /// Entry snapshot the UI publishes so the IPC thread can resolve targets and
@@ -54,6 +54,10 @@ pub enum IpcToUi {
     Focus,
     /// Headphone mute changed from the CLI (UI persists it).
     SpeakersMuted(bool),
+    /// Mic passthrough switched from the CLI (UI persists it).
+    Passthrough(bool),
+    /// Bass changed from the CLI (UI persists it).
+    Bass(f32),
 }
 
 pub type Snapshot = Arc<Mutex<Vec<PlayEntry>>>;
@@ -169,6 +173,15 @@ fn handle_cmd(
                 }
             }
         }
+        "bass" => {
+            let Some(db) = v.get("value").and_then(|x| x.as_f64()) else {
+                return "ERR bass needs a value in dB".into();
+            };
+            let db = (db as f32).clamp(BASS_MIN_DB, BASS_MAX_DB);
+            let _ = engine_tx.send(EngineMsg::SetBass(db));
+            let _ = ui_tx.send(IpcToUi::Bass(db));
+            format!("bass: {db:+.0} dB")
+        }
         "hear" => {
             let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("status");
             let cur_hear = !muted.load(Ordering::Relaxed);
@@ -223,17 +236,26 @@ fn handle_cmd(
             let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("status");
             match state {
                 "on" => match crate::audio::mic::set_passthrough(true, v.get("source").and_then(|s| s.as_str())) {
-                    Ok(s) => format!("passthrough: {s}"),
+                    Ok(s) => {
+                        let _ = ui_tx.send(IpcToUi::Passthrough(s));
+                        format!("passthrough: {s}")
+                    }
                     Err(e) => format!("ERR {e}"),
                 },
                 "off" => match crate::audio::mic::set_passthrough(false, None) {
-                    Ok(s) => format!("passthrough: {s}"),
+                    Ok(s) => {
+                        let _ = ui_tx.send(IpcToUi::Passthrough(s));
+                        format!("passthrough: {s}")
+                    }
                     Err(e) => format!("ERR {e}"),
                 },
                 "toggle" => {
                     let cur = crate::audio::mic::passthrough_active();
                     match crate::audio::mic::set_passthrough(!cur, None) {
-                        Ok(s) => format!("passthrough: {s}"),
+                        Ok(s) => {
+                            let _ = ui_tx.send(IpcToUi::Passthrough(s));
+                            format!("passthrough: {s}")
+                        }
                         Err(e) => format!("ERR {e}"),
                     }
                 }
@@ -297,6 +319,7 @@ pub fn client(cmd: crate::Command) -> Result<(), String> {
         crate::Command::Add { paths } => json!({"cmd": "add", "paths": paths}),
         crate::Command::Mic { state } => json!({"cmd": "mic", "state": state}),
         crate::Command::Hear { state } => json!({"cmd": "hear", "state": state}),
+        crate::Command::Bass { db } => json!({"cmd": "bass", "value": db}),
         crate::Command::Vol { value } => json!({"cmd": "vol", "value": value}),
         crate::Command::Reload => json!({"cmd": "reload"}),
         crate::Command::Quit => json!({"cmd": "quit"}),

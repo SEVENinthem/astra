@@ -164,6 +164,7 @@ pub enum K {
     RouteShortMic,
     RouteShortBoth,
     More,
+    Bass,
 }
 
 pub fn tr(lang: Lang, k: K) -> &'static str {
@@ -421,6 +422,8 @@ pub fn tr(lang: Lang, k: K) -> &'static str {
         (Lang::Ru, K::RouteShortMic) => "Микрофон",
         (Lang::En, K::RouteShortBoth) => "Both",
         (Lang::Ru, K::RouteShortBoth) => "Оба",
+        (Lang::En, K::Bass) => "Bass",
+        (Lang::Ru, K::Bass) => "Бас",
         (Lang::En, K::More) => "More",
         (Lang::Ru, K::More) => "Ещё",
     }
