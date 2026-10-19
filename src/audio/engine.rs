@@ -43,6 +43,10 @@ const TARGET_FRAMES: usize = BLOCK * 2;
 const FADE: usize = 240;
 /// Decoded-audio cache budget in samples (f32): 64 Mi samples = 256 MB.
 const CACHE_BUDGET: usize = 64 * 1024 * 1024;
+/// Bass slider range (dB) and shelf corner frequency.
+pub const BASS_MIN_DB: f32 = -12.0;
+pub const BASS_MAX_DB: f32 = 15.0;
+const BASS_HZ: f32 = 120.0;
 /// Sounds up to this length are decoded ahead of time.
 pub const PRELOAD_MAX_SECS: f32 = 30.0;
 
@@ -66,6 +70,8 @@ pub enum EngineMsg {
     SetSpeakerSink(Option<String>),
     /// Keep playing, but silence ASTRA's own speaker/headphone output.
     SetSpeakersMuted(bool),
+    /// Bass shelf gain in dB (0 = off), applied to sounds on every output.
+    SetBass(f32),
     /// Local monitoring (mixer -> speakers loopback) is on: "Both" then
     /// skips the direct speaker copy, or you would hear every sound twice.
     SetLocalMonitor(bool),
@@ -97,6 +103,7 @@ impl Engine {
             active: Mutex::new(HashSet::new()),
             events: Mutex::new(etx),
             speakers_muted: AtomicBool::new(false),
+            bass_db: AtomicU32::new(0f32.to_bits()),
         });
         let cache = Arc::new(Mutex::new(Cache::default()));
 
@@ -140,6 +147,7 @@ struct Shared {
     active: Mutex<HashSet<u64>>,
     events: Mutex<Sender<EngineEvent>>,
     speakers_muted: AtomicBool,
+    bass_db: AtomicU32,
 }
 
 impl Shared {
@@ -209,6 +217,9 @@ fn control(
                 shared.speakers_muted.store(m, Ordering::Relaxed);
             }
             EngineMsg::SetLocalMonitor(on) => local_monitor = on,
+            EngineMsg::SetBass(db) => {
+                shared.bass_db.store(db.clamp(BASS_MIN_DB, BASS_MAX_DB).to_bits(), Ordering::Relaxed);
+            }
             EngineMsg::Preload(path) => {
                 let _ = preload.send(path);
             }
@@ -638,6 +649,58 @@ fn render(v: &mut Voice, out: &mut [f32], master: f32) -> VoiceState {
     VoiceState::Playing
 }
 
+/// RBJ low-shelf biquad (stereo, interleaved) for the bass slider.
+#[derive(Default)]
+struct LowShelf {
+    db: f32,
+    b: [f32; 3],
+    a: [f32; 2],
+    /// per channel: x[n-1], x[n-2], y[n-1], y[n-2]
+    z: [[f32; 4]; 2],
+}
+
+impl LowShelf {
+    fn set_db(&mut self, db: f32) {
+        if (db - self.db).abs() < 0.01 && self.b[0] != 0.0 {
+            return;
+        }
+        self.db = db;
+        let a = 10f32.powf(db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * BASS_HZ / OUT_RATE as f32;
+        let (sin, cos) = w0.sin_cos();
+        let alpha = sin / 2.0 * 2f32.sqrt(); // shelf slope S = 1
+        let k = 2.0 * a.sqrt() * alpha;
+        let a0 = (a + 1.0) + (a - 1.0) * cos + k;
+        self.b = [
+            a * ((a + 1.0) - (a - 1.0) * cos + k) / a0,
+            2.0 * a * ((a - 1.0) - (a + 1.0) * cos) / a0,
+            a * ((a + 1.0) - (a - 1.0) * cos - k) / a0,
+        ];
+        self.a = [
+            -2.0 * ((a - 1.0) + (a + 1.0) * cos) / a0,
+            ((a + 1.0) + (a - 1.0) * cos - k) / a0,
+        ];
+    }
+
+    fn process(&mut self, block: &mut [f32]) {
+        if self.db.abs() < 0.01 {
+            self.z = [[0.0; 4]; 2];
+            return;
+        }
+        for f in block.chunks_exact_mut(2) {
+            for (ch, x) in f.iter_mut().enumerate() {
+                let z = &mut self.z[ch];
+                let y = self.b[0] * *x + self.b[1] * z[0] + self.b[2] * z[1] - self.a[0] * z[2] - self.a[1] * z[3];
+                z[1] = z[0];
+                z[0] = *x;
+                z[3] = z[2];
+                z[2] = y;
+                *x = y;
+            }
+        }
+    }
+}
+
 /// Transparent below 0.9, then bends smoothly into ±1.0 instead of
 /// hard-clipping loud mixes (master volume > 100 %, several sounds).
 fn soft_clip(x: f32) -> f32 {
@@ -789,6 +852,7 @@ impl Output {
         let is_speakers = matches!(self.kind, OutputKind::Speakers(_));
         // output gain, ramped per block so muting never clicks
         let mut out_gain = 1.0f32;
+        let mut bass = LowShelf::default();
         loop {
             // Idle: sleep until something arrives. The stream underruns and
             // restarts instantly thanks to the one-block prebuf.
@@ -830,6 +894,8 @@ impl Output {
                 }
                 alive
             });
+            bass.set_db(f32::from_bits(self.shared.bass_db.load(Ordering::Relaxed)));
+            bass.process(&mut block);
             let target = if is_speakers && self.shared.speakers_muted.load(Ordering::Relaxed) {
                 0.0
             } else {
@@ -933,6 +999,30 @@ mod tests {
         render(&mut v, &mut out, 1.0);
         assert!((v.pos - BLOCK as f64 * 44_100.0 / 48_000.0).abs() < 1e-6);
         assert!(out.iter().all(|s| (s - 0.25).abs() < 1e-5));
+    }
+
+    /// Steady-state level of a sine through the shelf, in dB.
+    fn shelf_gain_db(db: f32, hz: f32) -> f32 {
+        let mut f = LowShelf::default();
+        f.set_db(db);
+        let mut buf: Vec<f32> = (0..OUT_RATE as usize)
+            .flat_map(|i| {
+                let v = (i as f32 * 2.0 * std::f32::consts::PI * hz / OUT_RATE as f32).sin() * 0.1;
+                [v, v]
+            })
+            .collect();
+        f.process(&mut buf);
+        let tail = &buf[buf.len() / 2..];
+        let peak = tail.iter().fold(0f32, |m, s| m.max(s.abs()));
+        20.0 * (peak / 0.1).log10()
+    }
+
+    #[test]
+    fn bass_shelf_boosts_lows_only() {
+        assert!((shelf_gain_db(12.0, 30.0) - 12.0).abs() < 0.7);
+        assert!(shelf_gain_db(12.0, 3000.0).abs() < 0.5);
+        assert!((shelf_gain_db(-12.0, 30.0) + 12.0).abs() < 0.7);
+        assert!(shelf_gain_db(0.0, 50.0).abs() < 0.01);
     }
 
     #[test]

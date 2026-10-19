@@ -50,6 +50,8 @@ enum Command {
     Mic { state: String },
     /// Hear sounds in your own headphones: on | off | toggle | status
     Hear { state: String },
+    /// Bass boost/cut in dB (-12..15, 0 = flat)
+    Bass { db: f32 },
     /// Set master volume in percent (0..150)
     Vol { value: f32 },
     /// Re-read the config file from disk
