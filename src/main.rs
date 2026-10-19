@@ -48,6 +48,8 @@ enum Command {
     Add { paths: Vec<String> },
     /// Microphone passthrough: on | off | toggle | status
     Mic { state: String },
+    /// Hear sounds in your own headphones: on | off | toggle | status
+    Hear { state: String },
     /// Set master volume in percent (0..150)
     Vol { value: f32 },
     /// Re-read the config file from disk
